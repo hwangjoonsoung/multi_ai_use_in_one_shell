@@ -68,10 +68,13 @@ public final class WindowsCommandResolver implements CommandResolver {
         for (Path root : npmRoots()) {
             Path base = root.resolve("node_modules/@openai/codex/node_modules");
             if (!Files.isDirectory(base)) continue;
-            try (Stream<Path> s = Files.walk(base, 5)) {
+            // 실측 경로는 base 기준 6단계다:
+            //   @openai/codex-win32-x64/vendor/<triple>/bin/codex.exe
+            // 패키지 레이아웃이 바뀔 수 있으니 여유를 둔다.
+            try (Stream<Path> s = Files.walk(base, 8)) {
                 Optional<Path> hit = s
                         .filter(p -> p.getFileName().toString().equals("codex.exe"))
-                        .filter(p -> p.toString().replace('\', '/').contains("/vendor/"))
+                        .filter(p -> p.toString().replace('\\', '/').contains("/vendor/"))
                         .filter(Files::isExecutable)
                         .findFirst();
                 if (hit.isPresent()) return hit;
