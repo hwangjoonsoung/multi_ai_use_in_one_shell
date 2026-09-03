@@ -9,9 +9,12 @@ Claude · Codex · Gemini(agy) 세 AI가 한 채팅방에 참여자로 들어와
 ```powershell
 .\scripts\doctor.ps1                 # CLI 설치·인증·모델 점검
 .\scripts\compile.ps1                # javac (외부 라이브러리 없음, D12)
-.\scriptsun.ps1                    # 현재 디렉터리를 워크스페이스로 실행
-.\scriptsun.ps1 -Workspace C:\proj  # 대상 워크스페이스 지정 (D18)
-.\scriptsun.ps1 -Room 20260903-141530   # 기존 방 재개
+.\scripts
+un.ps1                    # 현재 디렉터리를 워크스페이스로 실행
+.\scripts
+un.ps1 -Workspace C:\proj  # 대상 워크스페이스 지정 (D18)
+.\scripts
+un.ps1 -Room 20260903-141530   # 기존 방 재개
 ```
 
 방 안에서 쓰는 명령:
@@ -22,6 +25,8 @@ Claude · Codex · Gemini(agy) 세 AI가 한 채팅방에 참여자로 들어와
 | `@claude` / `@codex` / `@gemini <질문>` | 지목 호출 |
 | `/status` | 참여자 경로·방 상태 |
 | `/rooms` · `/open <ID>` · `/new [이름]` | 방 목록·재개·생성 |
+| `/run @<참여자> [--write] <프롬프트>` | 지정 권한으로 **1회** 실행. `--write` 는 참여자 1명만 |
+| `/preset [list\|save\|run\|rm]` | 프롬프트 프리셋. 실행해도 권한은 승격되지 않는다 |
 | `/cancel [참여자]` | 실행 중 프로세스 종료 (best-effort) |
 | `/exit` | 저장 후 종료 |
 

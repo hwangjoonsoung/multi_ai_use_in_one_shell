@@ -20,7 +20,11 @@ public final class CommandParser {
     /** @param targets 비어 있으면 전 참여자 */
     public record Chat(List<String> targets, String text) implements Input {}
 
-    public record Slash(String name, List<String> args) implements Input {}
+    /**
+     * @param args 공백으로 자른 인수
+     * @param raw  명령 이름 뒤의 원문. 프롬프트처럼 공백을 보존해야 할 때 쓴다.
+     */
+    public record Slash(String name, List<String> args, String raw) implements Input {}
 
     private final Set<String> knownMentions;
 
@@ -36,7 +40,10 @@ public final class CommandParser {
             List<String> args = parts.length > 1
                     ? List.of(Arrays.copyOfRange(parts, 1, parts.length))
                     : List.of();
-            return new Slash(name, args);
+            String body = s.substring(1);
+            int sp = firstSpace(body);
+            String tail = sp < 0 ? "" : body.substring(sp + 1).stripLeading();
+            return new Slash(name, args, tail);
         }
 
         List<String> targets = new ArrayList<>();
