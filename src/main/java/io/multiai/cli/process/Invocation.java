@@ -12,13 +12,15 @@ import java.util.List;
  * @param stdinBody  stdin 으로 주입할 프롬프트. null 이면 주입하지 않고 즉시 close.
  * @param timeout    Java 가 강제하는 타임아웃 (SPEC D16 — 공통 600초)
  * @param label      로그·오류 표시에 쓰는 참여자 이름
+ * @param runDir     이 라운드의 원본 stdout·stderr 를 남길 디렉터리
  */
 public record Invocation(
         List<String> command,
         Path workspace,
         String stdinBody,
         java.time.Duration timeout,
-        String label) {
+        String label,
+        Path runDir) {
 
     public Invocation {
         if (command == null || command.isEmpty()) {

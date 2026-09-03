@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -24,8 +25,17 @@ import java.util.UUID;
 public final class CodexCliAdapter extends AbstractCliProvider {
 
     private volatile Path lastOutFile;
+    private final String modelOverride;
 
-    public CodexCliAdapter(ResolvedCommand c, ProcessLauncher l) { super(c, l); }
+    public CodexCliAdapter(ResolvedCommand c, ProcessLauncher l) {
+        this(c, l, null);
+    }
+
+    /** @param modelOverride config.properties 의 codex.model. null 이면 CLI 기본값 */
+    public CodexCliAdapter(ResolvedCommand c, ProcessLauncher l, String modelOverride) {
+        super(c, l);
+        this.modelOverride = modelOverride;
+    }
 
     @Override public String id() { return "codex"; }
     @Override public String displayName() { return "Codex"; }
@@ -33,16 +43,26 @@ public final class CodexCliAdapter extends AbstractCliProvider {
 
     @Override
     protected List<String> arguments(String prompt, Path ws, boolean write,
-                                     Path tempDir, Duration timeout) {
+                                     Path tempDir, Duration timeout, Path schemaFile) {
         Path out = tempDir.resolve(UUID.randomUUID() + ".md");
         lastOutFile = out;
-        return List.of(
+        List<String> a = new ArrayList<>(List.of(
                 "exec", "-",
                 "--skip-git-repo-check",
                 "-C", ws.toString(),
                 "-s", write ? "workspace-write" : "read-only",
                 "-c", "model_reasoning_effort=\"high\"",
-                "-o", out.toString());
+                "-o", out.toString()));
+        if (modelOverride != null && !modelOverride.isBlank()) {
+            // 계정에 따라 기본 모델이 요청을 거부할 수 있다 — 실측 사례:
+            // "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."
+            a.add("-c");
+            a.add("model=\"" + modelOverride.trim() + "\"");
+        }
+        // --output-schema 는 쓰지 않는다. ChatGPT 계정에서는 기본 모델이 구조화 출력을
+        // 지원하지 않아 400 "model is not supported" 로 거부된다 (실측). 대신 프롬프트에
+        // 스키마를 넣어 형식을 유도하고 -o 파일 텍스트에서 JSON 을 추출한다.
+        return a;
     }
 
     @Override

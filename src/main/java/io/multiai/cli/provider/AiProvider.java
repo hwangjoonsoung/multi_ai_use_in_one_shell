@@ -36,7 +36,10 @@ public interface AiProvider {
      * @param write     쓰기 프로필 사용 여부. Phase 1 에서는 항상 false
      * @param runDir    원본 stdout·stderr 를 남길 디렉터리
      * @param tempDir   워크스페이스 밖 임시 출력 디렉터리 (§7.6)
+     * @param schemaFile 구조화 출력 스키마 파일. null 이면 평문 text 로 받는다.
+     *                   Windows 에서 인라인 JSON 인자는 깨지므로 반드시 경로다 (§1.5).
      */
     ProviderResult invoke(String prompt, Path workspace, boolean write,
-                          Path runDir, Path tempDir, Duration timeout) throws InterruptedException;
+                          Path runDir, Path tempDir, Duration timeout, Path schemaFile)
+            throws InterruptedException;
 }

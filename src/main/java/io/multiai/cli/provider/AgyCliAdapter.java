@@ -4,6 +4,7 @@ import io.multiai.cli.process.*;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -35,17 +36,23 @@ public final class AgyCliAdapter extends AbstractCliProvider {
 
     @Override
     protected List<String> arguments(String prompt, Path ws, boolean write,
-                                     Path tempDir, Duration timeout) {
+                                     Path tempDir, Duration timeout, Path schemaFile) {
         long cliSeconds = timeout.toSeconds() + 60;   // Java 보다 길게
-        return List.of(
+        List<String> a = new ArrayList<>(List.of(
                 "-p", prompt,
                 "--add-dir", ws.toString(),
                 "--model", model,
                 "--mode", write ? "accept-edits" : "plan",
                 "--sandbox",
                 "--disable-slash-commands",
-                "--output-format", "text",
-                "--print-timeout", cliSeconds + "s");
+                "--output-format", schemaFile == null ? "text" : "json",
+                "--print-timeout", cliSeconds + "s"));
+        if (schemaFile != null) {
+            // 반드시 파일 경로로 전달한다. 인라인 JSON 은 Windows 에서 깨진다 (§1.5).
+            a.add("--json-schema");
+            a.add(schemaFile.toString());
+        }
+        return a;
     }
 
     @Override

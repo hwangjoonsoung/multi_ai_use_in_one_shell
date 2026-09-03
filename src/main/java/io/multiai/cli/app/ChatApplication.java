@@ -3,6 +3,7 @@ package io.multiai.cli.app;
 import io.multiai.cli.orchestration.ParallelRoundExecutor;
 import io.multiai.cli.orchestration.PromptPresetRepository;
 import io.multiai.cli.orchestration.WorkspaceStatus;
+import io.multiai.cli.converge.*;
 import io.multiai.cli.process.*;
 import io.multiai.cli.provider.*;
 import io.multiai.cli.room.*;
@@ -147,6 +148,7 @@ public final class ChatApplication implements AutoCloseable {
             case "cancel" -> cancel(s.args());
             case "run" -> runCommand(s);
             case "preset" -> preset(s);
+            case "converge" -> converge(s);
             case "help" -> banner();
             default -> ui.error("알 수 없는 명령: /" + s.name() + "  (/help 로 목록 확인)");
         }
@@ -243,6 +245,104 @@ public final class ChatApplication implements AutoCloseable {
         ui.notice(presets.remove(a.get(1))
                 ? "삭제됨: " + a.get(1)
                 : "프리셋을 찾을 수 없다: " + a.get(1));
+    }
+
+    // ---------- Phase 3: 구조화 수렴 ----------
+
+    /**
+     * /converge [@수렴자] 안건. SPEC §7.5-1 · §7.9.
+     *
+     * 수렴자로 지명된 참여자는 검토 대상에서 제외된다 — 자기 답을 자기가 분류하면
+     * 자기 채점이 된다. 지명이 없으면 규칙 기반 분류만 수행한다.
+     */
+    private void converge(CommandParser.Slash s) throws IOException {
+        List<String> a = s.args();
+        String consolidator = null;
+        int skip = 0;
+        if (!a.isEmpty() && a.get(0).startsWith("@")) {
+            String id = a.get(0).substring(1).toLowerCase(Locale.ROOT);
+            if (!providerIds().contains(id)) {
+                ui.error("알 수 없는 수렴자: @" + id);
+                return;
+            }
+            consolidator = id;
+            skip = 1;
+        }
+        String subject = stripTokens(s.raw(), a.subList(0, skip));
+        if (subject.isBlank()) {
+            ui.error("사용법: /converge [@수렴자] <안건>");
+            ui.notice("수렴자를 지명하면 그 참여자는 검토에서 빠진다 (§7.5-1).");
+            return;
+        }
+
+        final String cons = consolidator;
+        List<AiProvider> reviewers = providers.stream()
+                .filter(p -> cons == null || !p.id().equals(cons)).toList();
+        if (reviewers.size() < 2) {
+            ui.error("검토자가 2명 미만이다. 수렴에는 최소 2명이 필요하다.");
+            return;
+        }
+
+        int round = room.startRound();
+        room.addUser("[converge] " + subject);
+        Path outDir = repo.runDir(room, round).resolve("converge");
+
+        ui.blank();
+        ui.notice("검토자: " + reviewers.stream().map(AiProvider::displayName).toList());
+        ui.notice(cons == null ? "수렴자: 규칙 기반 (모델 호출 없음)"
+                : "수렴자: " + cons + " (검토에서 제외됨)");
+
+        ConvergeSession session = new ConvergeSession(executor, repo.tempDir(), TIMEOUT);
+        ConvergeSession.Result res = session.run(reviewers, subject, room.workspace(), outDir,
+                new ConvergeSession.Progress() {
+                    @Override public void stage(String m) { ui.notice(m); }
+                    @Override public void reviewerDone(StructuredReview r) {
+                        ui.print("  [" + r.reviewerName() + "] " + r.verdict()
+                                + " · 지적 " + r.issues().size() + "건");
+                    }
+                });
+
+        if (res.aborted()) {
+            ui.error(res.abortReason());
+            repo.saveMeta(room);
+            return;
+        }
+        printConvergeSummary(res);
+        room.add("consolidator", "OK", 0, "수렴 보고서: " + res.report());
+        repo.saveMeta(room);
+    }
+
+    /** 터미널에는 판정 요약과 미해결만 낸다. 전문은 경로만 안내한다 (§7.5-1). */
+    private void printConvergeSummary(ConvergeSession.Result res) {
+        ConsolidationEngine.Outcome last = res.round2() != null ? res.round2() : res.round1();
+        ui.blank();
+        ui.print("== 판정 요약 ==");
+        for (StructuredReview r : last.reviews()) {
+            ui.print("  " + pad(r.reviewerName(), 18)
+                    + (r.valid() ? r.verdict().toString() : "응답 없음"));
+        }
+        if (res.round1().partial()) {
+            ui.error("PARTIAL — 응답 없음: " + String.join(", ", res.round1().failedReviewers()));
+        }
+
+        long agree = last.findings().stream()
+                .filter(f -> f.bucket() == ConsolidationEngine.Bucket.합의).count();
+        long dis = last.findings().stream()
+                .filter(f -> f.bucket() == ConsolidationEngine.Bucket.이견).count();
+        long solo = last.findings().stream()
+                .filter(f -> f.bucket() == ConsolidationEngine.Bucket.단독지적).count();
+        ui.blank();
+        ui.print("  합의 " + agree + " · 이견 " + dis + " · 단독 지적 " + solo
+                + " · 미해결 " + last.openQuestions().size());
+
+        if (!last.openQuestions().isEmpty()) {
+            ui.blank();
+            ui.print("== 사용자 결정 필요 ==");
+            last.openQuestions().forEach(q -> ui.print("  - " + q));
+        }
+        ui.blank();
+        ui.notice("보고서: " + res.report());
+        ui.blank();
     }
 
     /** SPEC §7.5 — 쓰기 실행 후 변경 목록만 보여준다. 커밋·푸시는 하지 않는다. */
@@ -349,6 +449,7 @@ public final class ChatApplication implements AutoCloseable {
         ui.print("  @claude/@codex/@gemini <질문>   지목 호출");
         ui.print("  /run @<참여자> [--write] <프롬프트>   지정 권한으로 1회 실행");
         ui.print("  /preset [list|save|run|rm] ...   프롬프트 프리셋 (권한 승격 없음)");
+        ui.print("  /converge [@수렴자] <안건>   구조화 교차검증 → REPORT.md");
         ui.print("  /status /rooms /open <ID> /new [이름] /cancel [참여자] /exit");
         ui.blank();
     }

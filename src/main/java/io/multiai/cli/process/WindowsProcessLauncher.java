@@ -17,7 +17,7 @@ import java.util.concurrent.*;
  */
 public final class WindowsProcessLauncher implements ProcessLauncher {
 
-    private final Path runDir;
+    private final Path fallbackDir;
     private final ExecutorService pumps = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "stream-pump");
         t.setDaemon(true);
@@ -26,15 +26,22 @@ public final class WindowsProcessLauncher implements ProcessLauncher {
     /** label -> 실행 중인 프로세스. /cancel 대상 조회용. */
     private final Map<String, Process> live = new ConcurrentHashMap<>();
 
-    public WindowsProcessLauncher(Path runDir) {
-        this.runDir = runDir;
+    /** @param fallbackDir invocation 이 runDir 을 주지 않을 때 쓸 위치 */
+    public WindowsProcessLauncher(Path fallbackDir) {
+        this.fallbackDir = fallbackDir;
     }
 
     @Override
     public RunOutcome run(Invocation inv) throws InterruptedException {
         long t0 = System.nanoTime();
-        Path outF = runDir.resolve(inv.label() + ".stdout.txt");
-        Path errF = runDir.resolve(inv.label() + ".stderr.txt");
+        Path dir = inv.runDir() != null ? inv.runDir() : fallbackDir;
+        try {
+            Files.createDirectories(dir);
+        } catch (IOException e) {
+            dir = fallbackDir;
+        }
+        Path outF = dir.resolve(inv.label() + ".stdout.txt");
+        Path errF = dir.resolve(inv.label() + ".stderr.txt");
 
         ProcessBuilder pb = new ProcessBuilder(inv.command());
         pb.directory(inv.workspace().toFile());

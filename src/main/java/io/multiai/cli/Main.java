@@ -76,8 +76,9 @@ public final class Main {
         resolver.resolve("claude").ifPresentOrElse(
                 c -> out.add(new ClaudeCliAdapter(c, launcher)),
                 () -> ui.error("claude 를 찾지 못했다 — 이 참여자는 비활성이다."));
+        String codexModel = cfg.getProperty("codex.model");
         resolver.resolve("codex").ifPresentOrElse(
-                c -> out.add(new CodexCliAdapter(c, launcher)),
+                c -> out.add(new CodexCliAdapter(c, launcher, codexModel)),
                 () -> ui.error("codex 를 찾지 못했다 — codex.cmd/.ps1 폴백은 쓰지 않는다(§6.3). 비활성."));
         String model = cfg.getProperty("agy.model", DEFAULT_AGY_MODEL);
         resolver.resolve("agy").ifPresentOrElse(

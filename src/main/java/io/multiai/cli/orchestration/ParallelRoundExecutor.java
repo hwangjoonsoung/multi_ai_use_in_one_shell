@@ -36,12 +36,19 @@ public final class ParallelRoundExecutor implements AutoCloseable {
     public List<ProviderResult> run(List<AiProvider> targets, String prompt, Path workspace,
                                     boolean write, Path runDir, Path tempDir,
                                     Duration timeout, Sink sink) {
+        return run(targets, prompt, workspace, write, runDir, tempDir, timeout, null, sink);
+    }
+
+    /** @param schemaFile 구조화 출력 스키마. null 이면 평문 text 로 받는다 (Phase 3). */
+    public List<ProviderResult> run(List<AiProvider> targets, String prompt, Path workspace,
+                                    boolean write, Path runDir, Path tempDir,
+                                    Duration timeout, Path schemaFile, Sink sink) {
 
         CompletionService<ProviderResult> cs = new ExecutorCompletionService<>(pool);
         for (AiProvider p : targets) {
             cs.submit(() -> {
                 try {
-                    return p.invoke(prompt, workspace, write, runDir, tempDir, timeout);
+                    return p.invoke(prompt, workspace, write, runDir, tempDir, timeout, schemaFile);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return cancelled(p);

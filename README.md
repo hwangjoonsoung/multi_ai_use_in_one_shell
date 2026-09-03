@@ -27,6 +27,7 @@ un.ps1 -Room 20260903-141530   # 기존 방 재개
 | `/rooms` · `/open <ID>` · `/new [이름]` | 방 목록·재개·생성 |
 | `/run @<참여자> [--write] <프롬프트>` | 지정 권한으로 **1회** 실행. `--write` 는 참여자 1명만 |
 | `/preset [list\|save\|run\|rm]` | 프롬프트 프리셋. 실행해도 권한은 승격되지 않는다 |
+| `/converge [@수렴자] <안건>` | **구조화 교차검증.** 독립 검토 → 분류 → 조건부 2라운드 → `REPORT.md` |
 | `/cancel [참여자]` | 실행 중 프로세스 종료 (best-effort) |
 | `/exit` | 저장 후 종료 |
 
@@ -80,6 +81,18 @@ agy -p $P --add-dir . --model gemini-3.1-pro-high `
 | **`REVIEW_REPORT.md`** | **수렴 보고서 — 합의·이견·미해결 분류와 결정 요청** |
 
 > 이 흐름 전체가 `SPEC.md` §7.9 **Phase 3(구조화 수렴)** 의 수동 예행연습이다. `REVIEW_REPORT.md` 는 Phase 3이 자동 생성해야 할 출력 형식의 참조 구현이 된다.
+
+## config.properties
+
+`%USERPROFILE%\.multi-ai-cli\config.properties` 로 기본값을 덮어쓴다.
+
+```properties
+agy.model=gemini-3.1-pro-high   # D13 기본값
+codex.model=                    # 계정이 기본 모델을 거부할 때 지정
+claude.path=                    # 자동 탐색 실패 시 실행 파일 경로
+codex.path=
+agy.path=
+```
 
 ## 충돌 시 우선순위
 

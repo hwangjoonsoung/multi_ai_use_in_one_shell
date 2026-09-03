@@ -27,21 +27,21 @@ abstract class AbstractCliProvider implements AiProvider {
 
     /** 공급자별 인수 목록. launcher 선행 인수는 호출부에서 붙인다. */
     protected abstract List<String> arguments(String prompt, Path workspace, boolean write,
-                                              Path tempDir, Duration timeout);
+                                              Path tempDir, Duration timeout, Path schemaFile);
 
     /** 원시 출력에서 사용자에게 보일 최종 텍스트를 뽑는다. */
     protected abstract String extractText(RunOutcome outcome, Path tempDir);
 
     @Override
     public ProviderResult invoke(String prompt, Path workspace, boolean write,
-                                 Path runDir, Path tempDir, Duration timeout)
+                                 Path runDir, Path tempDir, Duration timeout, Path schemaFile)
             throws InterruptedException {
 
         List<String> argv = new java.util.ArrayList<>(command.launcher());
-        argv.addAll(arguments(prompt, workspace, write, tempDir, timeout));
+        argv.addAll(arguments(prompt, workspace, write, tempDir, timeout, schemaFile));
 
         Invocation inv = new Invocation(
-                argv, workspace, acceptsStdin() ? prompt : null, timeout, id());
+                argv, workspace, acceptsStdin() ? prompt : null, timeout, id(), runDir);
         RunOutcome out = launcher.run(inv);
 
         String text = out.ok() ? extractText(out, tempDir) : "";
