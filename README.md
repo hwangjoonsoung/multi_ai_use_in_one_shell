@@ -2,7 +2,7 @@
 
 Claude · Codex · Gemini(agy) 세 AI가 한 채팅방에 참여자로 들어와, 같은 안건에 독립적으로 답한 뒤 서로의 답을 읽고 쟁점을 좁혀가는 독립 CLI 애플리케이션.
 
-**상태**: 설계 확정 · 구현 착수 전 (`SPEC.md` §9.2의 Q1~Q6 결정 대기)
+**상태**: 교차검토 1~5라운드 완료 · **codex·agy 양쪽 `GO`** · Phase 1 착수 가능 (blocker 0건, backlog 3건)
 
 ## 문서
 
@@ -14,6 +14,7 @@ Claude · Codex · Gemini(agy) 세 AI가 한 채팅방에 참여자로 들어와
 | 2 | **[SPEC.md](SPEC.md)** | 어떻게 만드는가. 요구사항·환경 실측·설계 스펙·미해결 쟁점 | 약 30,000자 |
 | 3 | [BACKGROUND.md](BACKGROUND.md) | 왜 다른 방식을 안 썼는가. 기존 솔루션 조사 | 약 8,000자 |
 | — | [ARCHIVE.md](ARCHIVE.md) | **폐기안. 실행 금지 · 동결** | 약 11,800자 |
+| ★ | **[REVIEW_REPORT.md](REVIEW_REPORT.md)** | **1차 교차검토 수렴 보고서.** 확정 사항과 사용자 결정 대기 항목 | 약 9,000자 |
 
 **`INTENT.md` → `SPEC.md` 순으로 읽는다.** `BACKGROUND.md`는 "왜 그건 안 썼나"라는 의문이 생겼을 때만 편다.
 

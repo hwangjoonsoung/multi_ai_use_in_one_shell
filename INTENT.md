@@ -113,10 +113,13 @@ Claude · Codex · Gemini 세 구독을 모두 결제 중이다. 따라서 **각
 | 설계 스펙 | 완료 (`SPEC.md` §4~§8) |
 | agy 독립 검토 | 완료 (`SPEC.md` §8.4, K1~K6) |
 | Claude 교차 확인 | 완료 (`SPEC.md` §9.1, F1~F10) |
-| **미해결 쟁점 결정** | **← 현재 위치. `SPEC.md` §9.2의 Q1~Q6** |
-| Phase 1 구현 | 미착수 |
+| 1차 교차검토 (codex·agy) | 완료 (`REVIEW_REPORT.md`). 양쪽 `CONDITIONAL` |
+| 미해결 쟁점 Q1·Q2·Q3·Q5 | **확정** (`SPEC.md` §9.2) |
+| 사용자 결정 U1~U4 | 완료 (`SPEC.md` `D13`~`D18`) |
+| 교차검토 1~5라운드 | **완료. 5라운드에서 codex·agy 양쪽 `GO`** (`REVIEW_REPORT.md`). 총 19건 조치 |
+| **Phase 1 구현** | **← 현재 위치. blocker 0건, 착수 가능** |
 
-**Q1과 Q3만 정해지면 Phase 1 착수가 가능하다.**
+**codex·agy·Claude 세 검토자 모두 `GO`. blocker 0건. Phase 1 착수 가능하다.** 남은 backlog 3건은 `REVIEW_REPORT.md` §R2-4에 있으며 Phase 3 또는 구현 중 처리한다.
 
 ---
 
