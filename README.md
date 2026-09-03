@@ -4,6 +4,27 @@ Claude · Codex · Gemini(agy) 세 AI가 한 채팅방에 참여자로 들어와
 
 **상태**: 교차검토 1~5라운드 완료 · **codex·agy 양쪽 `GO`** · Phase 1 착수 가능 (blocker 0건, backlog 3건)
 
+## 실행
+
+```powershell
+.\scripts\doctor.ps1                 # CLI 설치·인증·모델 점검
+.\scripts\compile.ps1                # javac (외부 라이브러리 없음, D12)
+.\scriptsun.ps1                    # 현재 디렉터리를 워크스페이스로 실행
+.\scriptsun.ps1 -Workspace C:\proj  # 대상 워크스페이스 지정 (D18)
+.\scriptsun.ps1 -Room 20260903-141530   # 기존 방 재개
+```
+
+방 안에서 쓰는 명령:
+
+| 입력 | 동작 |
+|---|---|
+| 일반 문장 | 전 참여자 동시 호출 |
+| `@claude` / `@codex` / `@gemini <질문>` | 지목 호출 |
+| `/status` | 참여자 경로·방 상태 |
+| `/rooms` · `/open <ID>` · `/new [이름]` | 방 목록·재개·생성 |
+| `/cancel [참여자]` | 실행 중 프로세스 종료 (best-effort) |
+| `/exit` | 저장 후 종료 |
+
 ## 문서
 
 읽는 순서가 정해져 있다.
