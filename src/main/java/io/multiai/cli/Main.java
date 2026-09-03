@@ -49,8 +49,9 @@ public final class Main {
         }
 
         Properties cfg = repo.loadConfig();
-        CommandResolver resolver = new WindowsCommandResolver(overridesFrom(cfg));
-        ProcessLauncher launcher = new WindowsProcessLauncher(repo.tempDir());
+        // OS 판별은 Platform 안에서만 한다 (SPEC §6.4). 여기부터 아래는 OS 를 모른다.
+        CommandResolver resolver = Platform.resolver(overridesFrom(cfg));
+        ProcessLauncher launcher = Platform.launcher(repo.tempDir());
 
         List<AiProvider> providers = buildProviders(resolver, launcher, cfg, ui);
         if (providers.isEmpty()) {
@@ -79,7 +80,7 @@ public final class Main {
         String codexModel = cfg.getProperty("codex.model");
         resolver.resolve("codex").ifPresentOrElse(
                 c -> out.add(new CodexCliAdapter(c, launcher, codexModel)),
-                () -> ui.error("codex 를 찾지 못했다 — codex.cmd/.ps1 폴백은 쓰지 않는다(§6.3). 비활성."));
+                () -> ui.error("codex 를 찾지 못했다 — 셸 래퍼 폴백은 쓰지 않는다(§6.3). 비활성."));
         String model = cfg.getProperty("agy.model", DEFAULT_AGY_MODEL);
         resolver.resolve("agy").ifPresentOrElse(
                 c -> out.add(new AgyCliAdapter(c, launcher, model)),

@@ -32,12 +32,9 @@ public final class RoomRepository {
         this.home = home;
     }
 
+    /** SPEC §7.6 — macOS 에서도 논리 구조는 ~/.multi-ai-cli/ 로 동일하다. */
     public static Path defaultHome() {
-        String up = System.getenv("USERPROFILE");
-        Path base = (up != null && !up.isBlank())
-                ? Path.of(up)
-                : Path.of(System.getProperty("user.home"));
-        return base.resolve(".multi-ai-cli");
+        return io.multiai.cli.process.Platform.home();
     }
 
     public Path home() { return home; }

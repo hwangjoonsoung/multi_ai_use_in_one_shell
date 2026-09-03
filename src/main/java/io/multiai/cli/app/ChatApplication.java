@@ -35,6 +35,7 @@ public final class ChatApplication implements AutoCloseable {
     private final PromptPresetRepository presets;
 
     private ChatRoom room;
+    private BufferedReader input;
 
     public ChatApplication(RoomRepository repo, List<AiProvider> providers,
                            ProcessLauncher launcher, ConsoleRenderer ui, ChatRoom room) {
@@ -62,6 +63,7 @@ public final class ChatApplication implements AutoCloseable {
         banner();
         try (BufferedReader in = new BufferedReader(
                 new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
+            this.input = in;
             while (true) {
                 ui.prompt(room.name());
                 String line = in.readLine();
@@ -113,8 +115,7 @@ public final class ChatApplication implements AutoCloseable {
                     + ", 워크스페이스 " + room.workspace());
         }
         ui.running(targets.stream().map(AiProvider::displayName).toList());
-        List<ProviderResult> results = executor.run(targets, prompt, room.workspace(),
-                write, runDir, repo.tempDir(), TIMEOUT, ui::result);
+        List<ProviderResult> results = runWatchingForCancel(targets, prompt, runDir, write);
 
         for (ProviderResult r : results) {
             room.add(r.providerId(), r.status().name(), r.elapsed().toMillis(),
@@ -126,6 +127,46 @@ public final class ChatApplication implements AutoCloseable {
 
         if (results.stream().noneMatch(ProviderResult::ok)) {
             ui.error("모든 참여자가 실패했다. /status 로 설치·인증 상태를 확인하라.");
+        }
+    }
+
+    /**
+     * 라운드를 백그라운드에서 돌리면서 stdin 을 폴링한다.
+     *
+     * 이렇게 하지 않으면 라운드가 도는 동안 입력 루프가 막혀 /cancel 을 칠 수 없다.
+     * §7.10 의 "/cancel 이 대상 프로세스를 종료한다" 를 실제로 만족시키려면
+     * 실행 중에도 입력을 받아야 한다.
+     */
+    private List<ProviderResult> runWatchingForCancel(List<AiProvider> targets, String prompt,
+                                                      Path runDir, boolean write) {
+        java.util.concurrent.CompletableFuture<List<ProviderResult>> f =
+                java.util.concurrent.CompletableFuture.supplyAsync(() ->
+                        executor.run(targets, prompt, room.workspace(), write,
+                                runDir, repo.tempDir(), TIMEOUT, ui::result));
+        try {
+            while (!f.isDone()) {
+                if (input != null && input.ready()) {
+                    String line = input.readLine();
+                    if (line == null) break;
+                    if (line.strip().startsWith("/cancel")) {
+                        List<String> a = new ArrayList<>(
+                                List.of(line.strip().split("[ \t]+")));
+                        a.remove(0);
+                        cancel(a);
+                    } else if (!line.isBlank()) {
+                        ui.notice("실행 중에는 /cancel 만 받는다. 입력 무시: " + preview(line));
+                    }
+                }
+                Thread.sleep(120);
+            }
+            return f.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            targets.forEach(t -> launcher.cancel(t.id()));
+            return List.of();
+        } catch (java.io.IOException | java.util.concurrent.ExecutionException e) {
+            ui.error("라운드 실행 오류: " + e.getMessage());
+            return List.of();
         }
     }
 
