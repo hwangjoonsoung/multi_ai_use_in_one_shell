@@ -182,7 +182,8 @@ public final class ChatApplication implements AutoCloseable {
 
     private void handleSlash(CommandParser.Slash s) throws IOException {
         switch (s.name()) {
-            case "status" -> status();
+            case "status" -> status(!s.args().isEmpty()
+                    && s.args().get(0).equalsIgnoreCase("auth"));
             case "new" -> newRoom(String.join(" ", s.args()));
             case "rooms" -> rooms();
             case "open" -> open(s.args());
@@ -404,7 +405,11 @@ public final class ChatApplication implements AutoCloseable {
 
     // ---------- 방 관리 ----------
 
-    private void status() {
+    /**
+     * @param probe true 면 각 CLI 를 실제로 호출해 인증 가능 여부를 확인한다.
+     *              SPEC §7.10 — agy 는 사용 가능한 Gemini 모델도 하나 이상 확인한다.
+     */
+    private void status(boolean probe) {
         ui.blank();
         ui.print("== 참여자 ==");
         for (AiProvider p : providers) {
@@ -412,7 +417,12 @@ public final class ChatApplication implements AutoCloseable {
             String tier = c.isPrimary() ? "" : "  [강등 tier " + c.tier() + "]";
             ui.print("  " + pad(p.displayName(), 18) + c.executable() + tier);
             if (!c.note().isBlank()) ui.print("      " + c.note());
+            if (probe) {
+                ui.print("      버전   " + probeVersion(c));
+                ui.print("      인증   " + probeAuth(p, c));
+            }
         }
+        if (!probe) ui.notice("인증·모델 확인은 /status auth");
         ui.blank();
         ui.print("== 방 ==");
         ui.print("  id        " + room.id());
@@ -424,6 +434,51 @@ public final class ChatApplication implements AutoCloseable {
         ui.print("  저장 위치 " + repo.home());
         ui.print("  프리셋    " + presets.all().size() + "건");
         ui.blank();
+    }
+
+    private String probeVersion(ResolvedCommand c) {
+        List<String> cmd = new ArrayList<>(c.launcher());
+        cmd.add("--version");
+        String out = runProbe(cmd, 20);
+        return out.isBlank() ? "확인 실패" : out.lines().findFirst().orElse("").strip();
+    }
+
+    /**
+     * 인증 가능 여부. agy 는 models 조회로 실제 사용 가능한 Gemini 모델까지 센다.
+     * claude·codex 는 버전 조회만으로는 인증을 알 수 없어 미확인으로 표시한다 —
+     * 짧은 실호출은 쿼터를 쓰므로 /status 에서 하지 않는다.
+     */
+    private String probeAuth(AiProvider p, ResolvedCommand c) {
+        if (!p.id().equals("gemini")) {
+            return "미확인 (첫 호출에서 판정)";
+        }
+        List<String> cmd = new ArrayList<>(c.launcher());
+        cmd.add("models");
+        String out = runProbe(cmd, 60);
+        long gemini = out.lines().filter(l -> l.startsWith("gemini-")).count();
+        if (gemini == 0) return "실패 — 모델 조회 불가. 재로그인이 필요할 수 있다";
+        return "정상 · Gemini 모델 " + gemini + "종 사용 가능";
+    }
+
+    /** 짧은 조회 명령을 돌려 stdout 을 얻는다. 실패는 빈 문자열이다. */
+    private String runProbe(List<String> cmd, int seconds) {
+        try {
+            Process pr = new ProcessBuilder(cmd)
+                    .directory(room.workspace().toFile())
+                    .redirectErrorStream(true).start();
+            pr.getOutputStream().close();
+            byte[] b = pr.getInputStream().readAllBytes();
+            if (!pr.waitFor(seconds, java.util.concurrent.TimeUnit.SECONDS)) {
+                pr.destroyForcibly();
+                return "";
+            }
+            return new String(b, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            return "";
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "";
+        }
     }
 
     private void newRoom(String name) throws IOException {
@@ -491,7 +546,7 @@ public final class ChatApplication implements AutoCloseable {
         ui.print("  /run @<참여자> [--write] <프롬프트>   지정 권한으로 1회 실행");
         ui.print("  /preset [list|save|run|rm] ...   프롬프트 프리셋 (권한 승격 없음)");
         ui.print("  /converge [@수렴자] <안건>   구조화 교차검증 → REPORT.md");
-        ui.print("  /status /rooms /open <ID> /new [이름] /cancel [참여자] /exit");
+        ui.print("  /status [auth] /rooms /open <ID> /new [이름] /cancel [참여자] /exit");
         ui.blank();
     }
 
