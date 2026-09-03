@@ -363,8 +363,13 @@ public final class ChatApplication implements AutoCloseable {
             ui.print("  " + pad(r.reviewerName(), 18)
                     + (r.valid() ? r.verdict().toString() : "응답 없음"));
         }
-        if (res.round1().partial()) {
-            ui.error("PARTIAL — 응답 없음: " + String.join(", ", res.round1().failedReviewers()));
+        // 1라운드와 2라운드의 실패를 모두 알린다 — last 만 보면 1라운드 실패를,
+        // round1 만 보면 2라운드 실패를 놓친다.
+        java.util.LinkedHashSet<String> failed =
+                new java.util.LinkedHashSet<>(res.round1().failedReviewers());
+        if (res.round2() != null) failed.addAll(res.round2().failedReviewers());
+        if (!failed.isEmpty()) {
+            ui.error("PARTIAL — 응답 없음: " + String.join(", ", failed));
         }
 
         long agree = last.findings().stream()

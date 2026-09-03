@@ -59,9 +59,16 @@ public final class CodexCliAdapter extends AbstractCliProvider {
             a.add("-c");
             a.add("model=\"" + modelOverride.trim() + "\"");
         }
-        // --output-schema 는 쓰지 않는다. ChatGPT 계정에서는 기본 모델이 구조화 출력을
-        // 지원하지 않아 400 "model is not supported" 로 거부된다 (실측). 대신 프롬프트에
-        // 스키마를 넣어 형식을 유도하고 -o 파일 텍스트에서 JSON 을 추출한다.
+        if (schemaFile != null) {
+            // CLI 레벨 스키마 강제. 스키마의 모든 object 에 additionalProperties:false 가
+            // 있어야 한다 — OpenAI strict 구조화 출력 요구사항이다 (실측).
+            //
+            // 계정 권한에 따라 이 요청이 400 으로 거부될 수 있다("model is not supported
+            // when using Codex with a ChatGPT account"). 그때도 프롬프트에 스키마가
+            // 실려 있으므로 형식은 유지되고, 실패 시 라운드는 PARTIAL 로 진행한다.
+            a.add("--output-schema");
+            a.add(schemaFile.toString());
+        }
         return a;
     }
 

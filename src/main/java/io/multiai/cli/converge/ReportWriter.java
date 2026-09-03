@@ -36,8 +36,11 @@ public final class ReportWriter {
         b.append("- 일시: ").append(LocalDate.now()).append('\n');
         b.append("- 라운드: ").append(r2 != null ? 2 : 1).append('\n');
         b.append("- 검토자: ").append(names(r1)).append('\n');
-        if (r1.partial()) {
-            b.append("- **PARTIAL — 응답 없음: ").append(String.join(", ", r1.failedReviewers()))
+        // 두 라운드의 실패를 합쳐 알린다 — r1 만 보면 2라운드 실패를 놓친다.
+        Set<String> failed = new LinkedHashSet<>(r1.failedReviewers());
+        if (r2 != null) failed.addAll(r2.failedReviewers());
+        if (!failed.isEmpty()) {
+            b.append("- **PARTIAL — 응답 없음: ").append(String.join(", ", failed))
              .append("**\n");
         }
         b.append('\n');
