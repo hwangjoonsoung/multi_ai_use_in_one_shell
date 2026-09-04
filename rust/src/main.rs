@@ -142,8 +142,12 @@ fn selftest() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(2).collect();
     let (prog, args): (String, Vec<String>) = if argv.is_empty() {
         (
-            "cmd".to_string(),
-            vec!["/c".into(), "echo 빨강 OK".into()],
+            "powershell".to_string(),
+            vec![
+                "-NoProfile".into(),
+                "-Command".into(),
+                "$e=[char]27; Write-Host \"${e}[31m빨강${e}[0m OK\"".into(),
+            ],
         )
     } else {
         (argv[0].clone(), argv[1..].to_vec())
@@ -166,7 +170,8 @@ fn selftest() -> Result<()> {
 
     let screen = s.screen();
     let text = screen_text(&screen);
-    println!("  자식 종료: {}", s.finished());
+    println!("  자식 종료: {} (코드 {:?})", s.finished(), s.exit_code);
+    println!("  수신 바이트: {}", s.rx_bytes);
     println!("  화면 첫 줄: {:?}", text.lines().next().unwrap_or(""));
 
     let mut ok = true;
@@ -208,10 +213,15 @@ fn screen_text(screen: &vt100::Screen) -> String {
     let (rows, cols) = screen.size();
     let mut out = String::new();
     for r in 0..rows {
-        for c in 0..cols {
+        let mut c = 0;
+        while c < cols {
             if let Some(cell) = screen.cell(r, c) {
                 let s = cell.contents();
                 out.push_str(if s.is_empty() { " " } else { &s });
+                // 와이드 문자는 두 칸을 차지한다. 뒤 칸은 이어지는 자리라 건너뛴다.
+                c += if cell.is_wide() { 2 } else { 1 };
+            } else {
+                c += 1;
             }
         }
         out.push('\n');

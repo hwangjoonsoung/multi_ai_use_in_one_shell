@@ -21,6 +21,10 @@ pub struct PtySession {
     rx: Receiver<Vec<u8>>,
     parser: Arc<Mutex<vt100::Parser>>,
     done: bool,
+    /// 진단용 — PTY 에서 실제로 받은 바이트 수
+    pub rx_bytes: usize,
+    /// 진단용 — 자식 종료 코드
+    pub exit_code: Option<u32>,
 }
 
 impl PtySession {
@@ -73,17 +77,26 @@ impl PtySession {
             rx,
             parser: Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 2000))),
             done: false,
+            rx_bytes: 0,
+            exit_code: None,
         })
     }
 
     /// 받은 출력을 전부 파서에 먹인다. 논블로킹이다.
     pub fn pump(&mut self) {
+        let mut pending_replies: Vec<u8> = Vec::new();
         loop {
             match self.rx.try_recv() {
                 Ok(chunk) => {
+                    self.rx_bytes += chunk.len();
+                    if std::env::var("MAI_DUMP").is_ok() {
+                        eprintln!("[rx {}] {:?}", chunk.len(), String::from_utf8_lossy(&chunk));
+                    }
                     if let Ok(mut p) = self.parser.lock() {
                         p.process(&chunk);
                     }
+                    // 자식이 던진 질의에 답한다. 안 하면 상대가 응답을 기다리며 멈춘다.
+                    pending_replies.extend(self.answer_queries(&chunk));
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -92,9 +105,62 @@ impl PtySession {
                 }
             }
         }
-        if let Ok(Some(_)) = self.child.try_wait() {
+        if !pending_replies.is_empty() {
+            let _ = self.write(&pending_replies);
+        }
+        if let Ok(Some(st)) = self.child.try_wait() {
+            self.exit_code = Some(st.exit_code());
             self.done = true;
         }
+    }
+
+    /// 터미널 질의에 대한 응답을 만든다.
+    ///
+    /// **에뮬레이터의 필수 책무다.** ConPTY 는 기동 직후 `ESC[6n`(커서 위치)을 보내고
+    /// 응답을 기다린다. 답하지 않으면 자식 출력이 한 바이트도 나오지 않는다
+    /// (R1 에서 실측으로 확인한 원인). vt100 크레이트는 이걸 대신해 주지 않는다.
+    fn answer_queries(&self, chunk: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 1 < chunk.len() {
+            if chunk[i] != 0x1b || chunk[i + 1] != b'[' {
+                i += 1;
+                continue;
+            }
+            // ESC [ ... <최종 바이트> 형태를 훑는다.
+            let start = i + 2;
+            let mut j = start;
+            while j < chunk.len() && !(0x40..=0x7e).contains(&chunk[j]) {
+                j += 1;
+            }
+            if j >= chunk.len() {
+                break;
+            }
+            let params = &chunk[start..j];
+            let final_byte = chunk[j];
+            match (params, final_byte) {
+                // DSR — 커서 위치 보고. 1-기준으로 답한다.
+                (b"6", b'n') | (b"?6", b'n') => {
+                    let (r, c) = self
+                        .parser
+                        .lock()
+                        .map(|p| p.screen().cursor_position())
+                        .unwrap_or((0, 0));
+                    out.extend_from_slice(
+                        format!("\x1b[{};{}R", r + 1, c + 1).as_bytes(),
+                    );
+                }
+                // DSR — 상태 보고. "이상 없음".
+                (b"5", b'n') => out.extend_from_slice(b"\x1b[0n"),
+                // DA1 — 장치 속성. VT100 상당으로 답한다.
+                (b"", b'c') | (b"0", b'c') => out.extend_from_slice(b"\x1b[?1;2c"),
+                // DA2 — 보조 장치 속성.
+                (b">", b'c') | (b">0", b'c') => out.extend_from_slice(b"\x1b[>0;10;1c"),
+                _ => {}
+            }
+            i = j + 1;
+        }
+        out
     }
 
     pub fn screen(&self) -> vt100::Screen {
@@ -191,6 +257,8 @@ impl PtySession {
             rx,
             parser: Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 2000))),
             done: false,
+            rx_bytes: 0,
+            exit_code: None,
         })
     }
 }
