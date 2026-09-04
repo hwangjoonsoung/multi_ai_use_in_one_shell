@@ -36,6 +36,10 @@ public final class ChatApplication implements AutoCloseable {
 
     private ChatRoom room;
     private BufferedReader input;
+    /** 직전 라운드 결과. /v 로 구역별 열람할 때 쓴다. */
+    private List<ProviderResult> lastResults = List.of();
+    /** 라운드 실행 중 들어온 입력. 버리지 않고 라운드가 끝난 뒤 처리한다. */
+    private final Deque<String> pending = new ArrayDeque<>();
 
     public ChatApplication(RoomRepository repo, List<AiProvider> providers,
                            ProcessLauncher launcher, ConsoleRenderer ui, ChatRoom room) {
@@ -65,8 +69,16 @@ public final class ChatApplication implements AutoCloseable {
                 new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
             this.input = in;
             while (true) {
-                ui.prompt(room.name());
-                String line = clean(in.readLine());
+                // 라운드 중 미리 타이핑해둔 입력을 먼저 소화한다.
+                String line;
+                if (!pending.isEmpty()) {
+                    line = pending.pollFirst();
+                    ui.prompt(room.name());
+                    ui.print(line);
+                } else {
+                    ui.prompt(room.name());
+                    line = clean(in.readLine());
+                }
                 if (line == null) break;
                 if (line.isBlank()) continue;
 
@@ -116,6 +128,8 @@ public final class ChatApplication implements AutoCloseable {
         }
         ui.running(targets.stream().map(AiProvider::displayName).toList());
         List<ProviderResult> results = runWatchingForCancel(targets, prompt, runDir, write);
+        lastResults = results;
+        ui.roundSummary(results);
 
         for (ProviderResult r : results) {
             room.add(r.providerId(), r.status().name(), r.elapsed().toMillis(),
@@ -142,7 +156,7 @@ public final class ChatApplication implements AutoCloseable {
         java.util.concurrent.CompletableFuture<List<ProviderResult>> f =
                 java.util.concurrent.CompletableFuture.supplyAsync(() ->
                         executor.run(targets, prompt, room.workspace(), write,
-                                runDir, repo.tempDir(), TIMEOUT, ui::result));
+                                runDir, repo.tempDir(), TIMEOUT, r -> {}));
         try {
             while (!f.isDone()) {
                 if (input != null && input.ready()) {
@@ -154,7 +168,8 @@ public final class ChatApplication implements AutoCloseable {
                         a.remove(0);
                         cancel(a);
                     } else if (!line.isBlank()) {
-                        ui.notice("실행 중에는 /cancel 만 받는다. 입력 무시: " + preview(line));
+                        // 버리지 않는다. 라운드가 끝나면 순서대로 처리한다.
+                        pending.addLast(line);
                     }
                 }
                 Thread.sleep(120);
@@ -167,6 +182,70 @@ public final class ChatApplication implements AutoCloseable {
         } catch (java.io.IOException | java.util.concurrent.ExecutionException e) {
             ui.error("라운드 실행 오류: " + e.getMessage());
             return List.of();
+        }
+    }
+
+    /**
+     * /v [번호|all] — 직전 라운드의 답변 구역을 펼쳐 본다.
+     *
+     * 세 답변을 한꺼번에 쏟으면 읽을 수가 없어서, 라운드가 끝나면 요약표만 보여주고
+     * 여기서 원하는 것만 골라 보게 한다.
+     */
+    private void view(List<String> args) {
+        if (lastResults.isEmpty()) {
+            ui.error("아직 답변이 없다. 먼저 질문을 하라.");
+            return;
+        }
+        if (args.isEmpty()) {
+            ui.roundSummary(lastResults);
+            return;
+        }
+        String a = args.get(0).toLowerCase(Locale.ROOT);
+        if (a.equals("all") || a.equals("a")) {
+            for (int i = 0; i < lastResults.size(); i++) ui.answer(i + 1, lastResults.get(i));
+            return;
+        }
+        // 번호로도, 참여자 이름으로도 고를 수 있게 한다.
+        String id = a.replaceFirst("^@", "");
+        for (int i = 0; i < lastResults.size(); i++) {
+            ProviderResult r = lastResults.get(i);
+            if (String.valueOf(i + 1).equals(a) || r.providerId().equals(id)) {
+                ui.answer(i + 1, r);
+                return;
+            }
+        }
+        ui.error("그런 답변이 없다: " + a + "   (/v 로 목록 확인)");
+    }
+
+    /**
+     * /context [메시지수] — 프롬프트에 실을 이전 대화 분량을 조절한다.
+     *
+     * 토큰이 나가는 지점은 이쪽이다. transcript.md 저장은 로컬 디스크 쓰기라
+     * 토큰과 무관하다.
+     */
+    private void context(List<String> args) {
+        if (args.isEmpty()) {
+            ui.blank();
+            ui.print("  이전 대화 포함   최근 " + PromptContextBuilder.maxMessages() + "개 메시지");
+            ui.print("  프롬프트 상한    " + String.format("%,d", PromptContextBuilder.maxChars()) + "자");
+            ui.blank();
+            ui.notice("/context 0    이전 대화를 안 넣는다 (매 질문이 독립 질의)");
+            ui.notice("/context 4    최근 4개만 넣는다");
+            ui.notice("토큰은 여기서 나간다. 기록 저장(transcript.md)은 토큰과 무관하다.");
+            ui.blank();
+            return;
+        }
+        try {
+            int n = Integer.parseInt(args.get(0));
+            PromptContextBuilder.configure(n, PromptContextBuilder.maxChars());
+            ui.notice(n == 0
+                    ? "이전 대화를 넣지 않는다. 매 질문이 독립 질의가 된다."
+                    : "이전 대화를 최근 " + n + "개까지 넣는다.");
+            if (n == 0) {
+                ui.notice("다른 AI 의 답을 읽고 답하는 협업 구조는 꺼진다 (INTENT.md §5).");
+            }
+        } catch (NumberFormatException e) {
+            ui.error("사용법: /context [메시지수]   예) /context 4");
         }
     }
 
@@ -191,6 +270,8 @@ public final class ChatApplication implements AutoCloseable {
             case "run" -> runCommand(s);
             case "preset" -> preset(s);
             case "converge" -> converge(s);
+            case "v", "view" -> view(s.args());
+            case "context" -> context(s.args());
             case "help" -> banner();
             default -> ui.error("알 수 없는 명령: /" + s.name() + "  (/help 로 목록 확인)");
         }
@@ -551,6 +632,8 @@ public final class ChatApplication implements AutoCloseable {
         ui.print("  /run @<참여자> [--write] <프롬프트>   지정 권한으로 1회 실행");
         ui.print("  /preset [list|save|run|rm] ...   프롬프트 프리셋 (권한 승격 없음)");
         ui.print("  /converge [@수렴자] <안건>   구조화 교차검증 → REPORT.md");
+        ui.print("  /v <번호|all>      답변 구역 펼쳐 보기");
+        ui.print("  /context [n]       프롬프트에 실을 이전 대화 분량 (토큰 조절)");
         ui.print("  /status [auth] /rooms /open <ID> /new [이름] /cancel [참여자] /exit");
         ui.blank();
     }

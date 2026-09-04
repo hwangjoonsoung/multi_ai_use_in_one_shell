@@ -59,6 +59,17 @@ public final class Main {
             return 1;
         }
 
+        // 프롬프트에 실을 이전 대화 분량. 토큰이 나가는 지점이라 설정으로 뺀다.
+        try {
+            io.multiai.cli.room.PromptContextBuilder.configure(
+                    Integer.parseInt(cfg.getProperty("context.messages",
+                            String.valueOf(io.multiai.cli.room.PromptContextBuilder.MAX_MESSAGES))),
+                    Integer.parseInt(cfg.getProperty("context.chars",
+                            String.valueOf(io.multiai.cli.room.PromptContextBuilder.MAX_CHARS))));
+        } catch (NumberFormatException e) {
+            ui.error("config.properties 의 context.* 값이 숫자가 아니다. 기본값을 쓴다.");
+        }
+
         ChatRoom room = opt.containsKey("room")
                 ? repo.open(opt.get("room"))
                 : repo.create(null, workspace);

@@ -13,8 +13,34 @@ import java.util.*;
  */
 public final class PromptContextBuilder {
 
+    /**
+     * 최종 조립 프롬프트 전체의 상한 (D15). 낮추는 것은 안전하지만 올리면 안 된다 —
+     * Windows 명령행 한계가 32,767자이고 agy 는 프롬프트를 인자로만 받는다 (§5.3 실측).
+     */
     public static final int MAX_CHARS = 16_000;
     public static final int MAX_MESSAGES = 12;
+
+    /**
+     * 실제로 토큰을 쓰는 지점은 여기다.
+     *
+     * transcript.md 저장은 로컬 디스크 쓰기라 토큰과 무관하지만, 이전 대화를 매 라운드
+     * 프롬프트에 실어 보내는 것은 매번 입력 토큰으로 청구된다. 토큰을 줄이려면 이 값을
+     * 낮춘다. 0 이면 이전 대화를 아예 넣지 않는다 — 매 질문이 독립 질의가 된다.
+     *
+     * 다만 0 으로 두면 "다음 라운드부터 다른 AI 의 답을 읽고 답한다" 는 협업 구조가
+     * 사라진다 (INTENT.md §5). 교차검증을 쓸 거면 최소 몇 턴은 남겨야 한다.
+     */
+    private static volatile int maxMessages = MAX_MESSAGES;
+    private static volatile int maxChars = MAX_CHARS;
+
+    public static int maxMessages() { return maxMessages; }
+    public static int maxChars() { return maxChars; }
+
+    /** @param messages 프롬프트에 실을 이전 메시지 수. 0 이면 문맥을 넣지 않는다. */
+    public static void configure(int messages, int chars) {
+        maxMessages = Math.max(0, messages);
+        maxChars = Math.min(MAX_CHARS, Math.max(1_000, chars));
+    }
 
     /** 상한을 넘겨 실행할 수 없는 요청. 잘라 보내지 않는다. */
     public static final class RequestTooLargeException extends Exception {
@@ -41,8 +67,8 @@ public final class PromptContextBuilder {
         String head = header(room, speaker);
         String tail = "\n## 이번 요청\n\n" + userInput + "\n";
         int fixed = head.length() + tail.length();
-        if (fixed > MAX_CHARS) {
-            throw new RequestTooLargeException(fixed, MAX_CHARS);
+        if (fixed > maxChars) {
+            throw new RequestTooLargeException(fixed, maxChars);
         }
 
         // 최신 메시지부터 담고, 상한에 닿으면 멈춘다 (= 오래된 것부터 제거).
@@ -50,11 +76,11 @@ public final class PromptContextBuilder {
         Deque<String> blocks = new ArrayDeque<>();
         int used = fixed;
         int taken = 0;
-        for (int i = src.size() - 1; i >= 0 && taken < MAX_MESSAGES; i--) {
+        for (int i = src.size() - 1; i >= 0 && taken < maxMessages; i--) {
             ChatMessage m = src.get(i);
             if (m.state() == ChatMessage.State.CORRUPT) continue;
             String b = renderBlock(m);
-            if (used + b.length() > MAX_CHARS) break;
+            if (used + b.length() > maxChars) break;
             blocks.addFirst(b);
             used += b.length();
             taken++;
