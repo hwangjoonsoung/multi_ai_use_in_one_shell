@@ -52,6 +52,8 @@ pub enum Hit {
     AddSpace,
     /// 새 세션 추가 (+)
     AddSession,
+    /// 전체 보기 탭
+    ShowAll,
 }
 
 pub struct App {
@@ -74,6 +76,8 @@ pub struct App {
     /// 사이드바 스크롤 오프셋 (줄 단위)
     pub space_scroll: u16,
     pub agent_scroll: u16,
+    /// 탭 모드에서도 전부 나란히 본다. [전체] 탭이 켜는 값이다.
+    pub show_all: bool,
 
     // ---- 마지막 렌더의 클릭 대상. 마우스 판정에 쓴다. ----
     pane_hit: Vec<(usize, Rect)>,
@@ -82,6 +86,7 @@ pub struct App {
     agent_hit: Vec<(usize, Rect)>,
     add_space_hit: Option<Rect>,
     add_session_hit: Option<Rect>,
+    all_tab_hit: Option<Rect>,
     /// 사이드바의 두 칸 영역. 휠 스크롤을 어디에 적용할지 가른다.
     spaces_area: Rect,
     agents_area: Rect,
@@ -103,12 +108,14 @@ impl App {
             quit: false,
             space_scroll: 0,
             agent_scroll: 0,
+            show_all: false,
             pane_hit: Vec::new(),
             close_hit: Vec::new(),
             space_hit: Vec::new(),
             agent_hit: Vec::new(),
             add_space_hit: None,
             add_session_hit: None,
+            all_tab_hit: None,
             spaces_area: Rect::ZERO,
             agents_area: Rect::ZERO,
         }
@@ -138,7 +145,7 @@ impl App {
     // ---------- 공간 ----------
 
     pub fn add_space(&mut self, path: &str) -> Result<(), String> {
-        let p = PathBuf::from(path.trim());
+        let p = expand_tilde(path.trim());
         if !p.is_dir() {
             return Err(format!("디렉터리가 아니다: {}", p.display()));
         }
@@ -279,7 +286,7 @@ impl App {
 
     /// 화면 크기가 바뀌면 각 PTY 도 자기 칸 크기로 맞춘다.
     pub fn sync_sizes(&mut self, area: Rect) {
-        let n = if self.tabbed() { 1 } else { self.visible().len() };
+        let n = if self.tabbed() && !self.show_all { 1 } else { self.visible().len() };
         let (h, w) = pane_size(area, n);
         for i in self.visible() {
             let s = &mut self.sessions[i];
@@ -303,6 +310,11 @@ impl App {
         if let Some(r) = &self.add_session_hit {
             if contains(r, x, y) {
                 return Some(Hit::AddSession);
+            }
+        }
+        if let Some(r) = &self.all_tab_hit {
+            if contains(r, x, y) {
+                return Some(Hit::ShowAll);
             }
         }
         // 닫기 버튼이 패널 영역 안에 있으므로 먼저 본다.
@@ -406,6 +418,16 @@ impl App {
     }
 
     fn draw_panes(&mut self, f: &mut Frame) {
+        // 클릭 대상은 **프레임 시작에 한 번** 비운다.
+        //
+        // 예전엔 탭 모드에서 비우지 않아 프레임마다 쌓였다. hit_test 는 먼저
+        // 맞는 것을 돌려주므로 배치가 달랐던 **옛 프레임의 좌표**가 이겼고,
+        // 세션을 닫거나 추가한 뒤로는 엉뚱한 에이전트로 옮겨졌다.
+        self.pane_hit.clear();
+        self.close_hit.clear();
+        self.add_session_hit = None;
+        self.all_tab_hit = None;
+
         let area = f.area();
         let vert = Layout::default()
             .direction(Direction::Vertical)
@@ -450,15 +472,32 @@ impl App {
     ///
     /// 탭 모드가 아니어도 그린다 — `+` 가 늘 같은 자리에 있어야 찾기 쉽다.
     fn draw_tabbar(&mut self, f: &mut Frame, area: Rect) {
-        self.add_session_hit = None;
         let vis = self.visible();
         let tabbed = vis.len() > MAX_SPLIT;
 
         let mut spans: Vec<Span> = Vec::new();
         let mut x = area.x;
+
+        // [전체] — 탭 모드에서 모든 에이전트를 한 번에 보는 탭.
+        // 탭 모드가 아니면 이미 다 보이므로 그리지 않는다.
+        if tabbed {
+            let label = " 전체 ";
+            let w = UnicodeWidthStr::width(label) as u16;
+            let style = if self.show_all {
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            spans.push(Span::styled(label, style));
+            spans.push(Span::raw(" "));
+            self.all_tab_hit = Some(Rect { x, y: area.y, width: w, height: 1 });
+            x += w + 1;
+        }
+
         for &i in &vis {
             let s = &self.sessions[i];
-            let focused = i == self.focus;
+            // 전체 보기 중에는 어떤 칩도 «선택된 탭»이 아니다. [전체] 가 선택돼 있다.
+            let focused = i == self.focus && !self.show_all;
             let label = format!(" {} ", s.title);
             let w = UnicodeWidthStr::width(label.as_str()) as u16;
             let style = if focused {
@@ -487,7 +526,6 @@ impl App {
 
     fn draw_bodies(&mut self, f: &mut Frame, area: Rect) {
         let vis = self.visible();
-        self.close_hit.clear();
         if vis.is_empty() {
             f.render_widget(
                 Paragraph::new("세션이 없다. [+] 로 에이전트를 띄운다.")
@@ -497,11 +535,10 @@ impl App {
             return;
         }
 
-        // 넷 이상이면 포커스된 하나만 크게. 셋 이하면 나란히.
-        let shown: Vec<usize> = if vis.len() > MAX_SPLIT {
+        // 넷 이상이면 포커스된 하나만 크게. 셋 이하면, 또는 [전체] 탭이면 나란히.
+        let shown: Vec<usize> = if vis.len() > MAX_SPLIT && !self.show_all {
             vec![if vis.contains(&self.focus) { self.focus } else { vis[0] }]
         } else {
-            self.pane_hit.clear();
             vis.clone()
         };
         let n = shown.len().max(1);
@@ -532,9 +569,7 @@ impl App {
                 );
                 self.close_hit.push((i, btn));
             }
-            if vis.len() <= MAX_SPLIT {
-                self.pane_hit.push((i, a));
-            }
+            self.pane_hit.push((i, a));
 
             if let Some(p) = s.pty.as_ref() {
                 let screen = p.screen();
@@ -593,6 +628,61 @@ impl App {
         put_cursor(f, inner, &self.input);
     }
 
+    /// 새 공간 입력에서 Tab — 경로를 채운다.
+    ///
+    /// 디렉터리만 후보로 둔다. 공간은 디렉터리이기 때문이다. 후보가 하나면
+    /// 끝까지 채우고 구분자를 붙인다. 여럿이면 **공통 접두사까지만** 채우고
+    /// 후보를 상태줄에 보여준다 — 셸과 같은 동작이다.
+    pub fn complete_path(&mut self) {
+        // `~` 는 먼저 풀어둔다. 그래야 이후 조작이 실제 경로 위에서 이뤄진다.
+        let sep = std::path::MAIN_SEPARATOR;
+        let mut expanded = expand_tilde(&self.input).to_string_lossy().into_owned();
+        // 구분자로 끝났다면 「이 안을 보여달라」는 뜻이다. 확장하면서 사라지므로
+        // 되살린다. 안 그러면 `~/` 가 홈의 **이름**을 완성하려 든다.
+        if self.input.trim_end().ends_with(['/', '\\']) && !expanded.ends_with(sep) {
+            expanded.push(sep);
+        }
+        let (dir, prefix) = match expanded.rfind(['/', '\\']) {
+            Some(i) => (expanded[..=i].to_string(), expanded[i + 1..].to_string()),
+            // 구분자가 없으면 현재 디렉터리에서 찾는다.
+            None => (format!(".{sep}"), expanded.clone()),
+        };
+
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            self.input = expanded;
+            self.status = format!("읽을 수 없는 경로: {dir}");
+            return;
+        };
+        let mut names: Vec<String> = rd
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| starts_with_ci(n, &prefix))
+            .collect();
+        names.sort_by_key(|a| a.to_lowercase());
+
+        match names.len() {
+            0 => {
+                self.input = expanded;
+                self.status = "일치하는 디렉터리가 없다".into();
+            }
+            1 => {
+                self.input = format!("{dir}{}{sep}", names[0]);
+                self.status = String::new();
+            }
+            _ => {
+                self.input = format!("{dir}{}", common_prefix(&names));
+                let shown: Vec<&str> = names.iter().take(6).map(String::as_str).collect();
+                self.status = format!(
+                    "{}개 후보 — {}{}",
+                    names.len(),
+                    shown.join(", "),
+                    if names.len() > 6 { " …" } else { "" }
+                );
+            }
+        }
+    }
+
     // 사이드바가 자기 영역과 클릭 대상을 등록한다.
     pub(crate) fn set_spaces_area(&mut self, r: Rect) {
         self.spaces_area = r;
@@ -612,6 +702,60 @@ impl App {
     pub(crate) fn set_add_space_hit(&mut self, r: Rect) {
         self.add_space_hit = Some(r);
     }
+}
+
+/// 선두의 `~` 를 홈 디렉터리로 바꾼다.
+///
+/// `~/foo` 는 셸이 풀어주는 표기라 우리 손에는 **문자 그대로** 들어온다.
+/// 그대로 `is_dir()` 하면 당연히 거짓이다.
+pub fn expand_tilde(s: &str) -> PathBuf {
+    let s = s.trim();
+    let rest = if s == "~" {
+        ""
+    } else if let Some(r) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
+        r
+    } else {
+        return PathBuf::from(s);
+    };
+    let Some(home) = home_dir() else { return PathBuf::from(s) };
+    if rest.is_empty() {
+        return home;
+    }
+    home.join(rest.replace('/', std::path::MAIN_SEPARATOR_STR))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
+/// `prefix` 로 시작하는가 — 대소문자를 가리지 않고, **문자 단위**로 본다.
+///
+/// 바이트로 자르면 한글 디렉터리에서 문자 경계를 깨고 패닉한다(실측).
+fn starts_with_ci(name: &str, prefix: &str) -> bool {
+    let mut n = name.chars();
+    prefix
+        .chars()
+        .all(|pc| n.next().is_some_and(|nc| nc.eq_ignore_ascii_case(&pc)))
+}
+
+/// 후보들의 공통 접두사. 탭 완성에서 어디까지 채울지 정한다.
+///
+/// 윈도우 경로는 대소문자를 가리지 않으므로 비교도 그렇게 한다.
+fn common_prefix(items: &[String]) -> String {
+    let Some(first) = items.first() else { return String::new() };
+    let mut n = first.chars().count();
+    for it in &items[1..] {
+        n = n.min(
+            first
+                .chars()
+                .zip(it.chars())
+                .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
+                .count(),
+        );
+    }
+    first.chars().take(n).collect()
 }
 
 pub const HINT: &str =
@@ -651,4 +795,39 @@ fn pane_size(area: Rect, n: usize) -> (u16, u16) {
     // 상단 경로 2줄 + 탭 1줄 + 상태 1줄 + 테두리 2줄
     let h = area.height.saturating_sub(6).max(6);
     (h, w)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 틸데를_홈으로_바꾼다() {
+        let home = home_dir().expect("홈을 알아야 한다");
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/Desktop"), home.join("Desktop"));
+        // 틸데가 아닌 것은 손대지 않는다.
+        assert_eq!(expand_tilde("C:/tmp"), PathBuf::from("C:/tmp"));
+        assert_eq!(expand_tilde("~notme"), PathBuf::from("~notme"));
+    }
+
+    #[test]
+    fn 한글_경로에서_패닉하지_않는다() {
+        // 바이트 슬라이스로 자르던 시절 여기서 깨졌다.
+        assert!(starts_with_ci("작업폴더", "작업"));
+        assert!(!starts_with_ci("작업폴더", "없는"));
+        assert!(!starts_with_ci("작", "작업"));
+        assert!(starts_with_ci("Desktop", "desk"));
+        assert!(starts_with_ci("anything", ""));
+    }
+
+    #[test]
+    fn 공통_접두사() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(common_prefix(&v(&["cricconf", "cric"])), "cric");
+        assert_eq!(common_prefix(&v(&["abc"])), "abc");
+        assert_eq!(common_prefix(&v(&["abc", "xyz"])), "");
+        // 대소문자를 가리지 않는다.
+        assert_eq!(common_prefix(&v(&["Desktop", "desktop2"])), "Desktop");
+    }
 }

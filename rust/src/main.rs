@@ -59,6 +59,20 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--selftest") => return selftest(),
+        Some("--complete") => {
+            // 경로 탭 완성을 화면 없이 확인한다. `~` 확장도 여기서 드러난다.
+            let mut app = App::new(AGENTS);
+            for raw in args.iter().skip(1) {
+                app.input = raw.clone();
+                app.status.clear();
+                app.complete_path();
+                outln!("  {raw:<28} -> {}", app.input);
+                if !app.status.is_empty() {
+                    outln!("  {:<28}    {}", "", app.status);
+                }
+            }
+            return Ok(());
+        }
         Some("--subs") => {
             // 서브에이전트 명부를 화면에서 읽어내는지 확인한다.
             //
@@ -282,6 +296,8 @@ fn on_key_new_space(app: &mut App, k: KeyEvent) -> Result<()> {
                 Err(e) => app.status = e,
             }
         }
+        // 셸처럼 Tab 으로 경로를 채운다. 공간은 디렉터리라 후보도 디렉터리뿐이다.
+        KeyCode::Tab => app.complete_path(),
         KeyCode::Backspace => {
             app.input.pop();
         }
@@ -369,7 +385,12 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
     }
     match app.hit_test(m.column, m.row) {
         Some(Hit::Close(i)) => app.close_session(i),
-        Some(Hit::Focus(i)) => app.focus = i,
+        Some(Hit::ShowAll) => app.show_all = true,
+        Some(Hit::Focus(i)) => {
+            // 특정 에이전트를 고르면 전체 보기에서 빠져나온다.
+            app.show_all = false;
+            app.focus = i;
+        }
         Some(Hit::Space(i)) => app.select_space(i),
         Some(Hit::AddSpace) => {
             app.input = app.active_path().to_string_lossy().into_owned();
