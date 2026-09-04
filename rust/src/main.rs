@@ -14,6 +14,7 @@
 //!   multi_ai_cli --selftest    PTY+VT 파이프라인 자동 점검
 
 mod app;
+mod procs;
 mod converge;
 mod room;
 mod sidebar;
@@ -22,10 +23,11 @@ mod trust;
 mod vtscreen;
 
 use anyhow::Result;
-use app::{App, Mode};
+use app::{App, Hit, Mode};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
+    event::{DisableMouseCapture, EnableMouseCapture, MouseButton, MouseEvent, MouseEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
@@ -35,7 +37,7 @@ use std::{io, time::Duration};
 const AGENTS: &[(&str, &str)] = &[
     ("claude", "Claude"),
     ("codex", "Codex"),
-    ("agy", "Gemini via agy"),
+    ("agy", "Gemini"),
 ];
 
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
@@ -137,13 +139,13 @@ where
 {
     enable_raw_mode()?;
     let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen)?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let mut term = Terminal::new(CrosstermBackend::new(out))?;
 
     let result = body(&mut term);
 
     disable_raw_mode()?;
-    execute!(term.backend_mut(), LeaveAlternateScreen)?;
+    execute!(term.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     term.show_cursor()?;
     result
 }
@@ -177,6 +179,7 @@ fn run(term: &mut Term) -> Result<()> {
                     Mode::Panes => on_key_panes(&mut app, k)?,
                 }
             }
+            Event::Mouse(m) => on_mouse(&mut app, m),
             Event::Resize(_, _) => {
                 let a = term.size()?;
                 app.sync_sizes(ratatui::layout::Rect::new(0, 0, a.width, a.height));
@@ -277,6 +280,21 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 클릭으로 패널을 고르거나 닫는다.
+///
+/// 마우스는 우리가 먹는다. 자식에게 넘기면 에이전트가 자기 좌표계로 해석해
+/// 엉뚱한 곳을 누른 것이 된다 — 패널마다 원점이 다르기 때문이다.
+fn on_mouse(app: &mut App, m: MouseEvent) {
+    if !matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return;
+    }
+    match app.hit_test(m.column, m.row) {
+        Some(Hit::Close(i)) => app.close_pane(i),
+        Some(Hit::Focus(i)) => app.focus = i,
+        None => {}
+    }
 }
 
 /// 한 에이전트만 전체 화면으로. R1 검증용으로 남겨둔다.

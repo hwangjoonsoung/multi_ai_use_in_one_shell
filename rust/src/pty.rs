@@ -166,6 +166,11 @@ impl PtySession {
         out
     }
 
+    /// 자식 프로세스 ID. 서브에이전트(자손 프로세스) 조회의 기준점이다.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+
     pub fn screen(&self) -> vt100::Screen {
         self.parser.lock().unwrap().screen().clone()
     }

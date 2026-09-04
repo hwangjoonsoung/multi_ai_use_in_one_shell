@@ -18,7 +18,8 @@ pub const WIDTH: u16 = 26;
 pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Min(3)])
+        // spaces 와 agents 를 반반으로 나눈다.
+        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
         .split(area);
 
     draw_spaces(f, rows[0], app);
@@ -62,14 +63,17 @@ fn draw_agents(f: &mut Frame, area: Rect, app: &App) {
 
     let mut lines: Vec<Line> = Vec::new();
     for (i, p) in app.panes.iter().enumerate() {
+        if p.closed {
+            continue;
+        }
         let focused = i == app.focus;
-        let st = p.state();
-        let (dot, color) = match st {
-            PaneState::Idle => ("○", Color::DarkGray),
-            PaneState::Starting => ("◍", Color::Yellow),
-            PaneState::Working => ("●", Color::Green),
-            PaneState::Quiet => ("◌", Color::Cyan),
-            PaneState::Exited => ("×", Color::Red),
+        // 상태는 색 점으로만 나타낸다. 글자로 적으면 좁은 칸에서 시끄럽다.
+        let color = match p.state() {
+            PaneState::Idle => Color::DarkGray,
+            PaneState::Starting => Color::Yellow,
+            PaneState::Working => Color::Green,
+            PaneState::Quiet => Color::Cyan,
+            PaneState::Exited => Color::Red,
         };
         let name_style = if focused {
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
@@ -77,12 +81,25 @@ fn draw_agents(f: &mut Frame, area: Rect, app: &App) {
             Style::default()
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("{dot} "), Style::default().fg(color)),
+            Span::styled("● ", Style::default().fg(color)),
             Span::styled(p.title.clone(), name_style),
         ]));
+
+        // 서브에이전트 — 에이전트가 띄운 자식 프로세스다.
+        // 어떤 서브에이전트인지는 알 수 없어 이름과 PID 만 보여준다.
+        for (n, (pid, name)) in p.subagents.iter().enumerate() {
+            let last = n + 1 == p.subagents.len();
+            let branch = if last { "  └ " } else { "  ├ " };
+            lines.push(Line::from(Span::styled(
+                format!("{branch}{name} {pid}"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    if lines.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!("  {}  ·  alt+{}", st.label(), i + 1),
-            Style::default().fg(color),
+            "참여자 없음",
+            Style::default().fg(Color::DarkGray),
         )));
     }
     f.render_widget(Paragraph::new(lines), inner);

@@ -26,6 +26,9 @@ unicode-width = "0.2.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# 서브에이전트(자식 프로세스) 트리 조회. 초당 1회만 갱신한다.
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+
 anyhow = "1"
 
 [dev-dependencies]

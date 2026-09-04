@@ -29,6 +29,10 @@ pub struct Pane {
     started: Option<Instant>,
     /// 마지막으로 관측한 수신 바이트 수와 그 시각. 출력이 멎으면 준비된 것으로 본다.
     seen: (usize, Instant),
+    /// 사용자가 닫은 칸. 배치에서 빠진다.
+    pub closed: bool,
+    /// 이 에이전트가 띄운 자식 프로세스 (이름, PID)
+    pub subagents: Vec<(u32, String)>,
 }
 
 impl Pane {
@@ -41,6 +45,8 @@ impl Pane {
             pending: None,
             started: None,
             seen: (0, Instant::now()),
+            closed: false,
+            subagents: Vec::new(),
         }
     }
 
@@ -117,6 +123,16 @@ impl PaneState {
     }
 }
 
+/// 마우스 클릭이 무엇을 가리키는가.
+pub enum Hit {
+    Focus(usize),
+    Close(usize),
+}
+
+fn contains(r: &Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
 pub enum Mode {
     Idle,
     Panes,
@@ -137,6 +153,12 @@ pub struct App {
     pub workspace_name: String,
     pub workspace_path: String,
     pub branch: String,
+    /// 서브에이전트 조회. 초당 1회만 실제로 훑는다.
+    procs: crate::procs::Tree,
+    /// 마지막 렌더의 칸 위치. 마우스 클릭을 어느 칸으로 보낼지 판정한다.
+    hit: Vec<(usize, Rect)>,
+    /// 닫기 버튼 위치.
+    close_btn: Vec<(usize, Rect)>,
 }
 
 impl App {
@@ -153,6 +175,9 @@ impl App {
             workspace_name: String::new(),
             workspace_path: String::new(),
             branch: String::new(),
+            procs: crate::procs::Tree::new(),
+            hit: Vec::new(),
+            close_btn: Vec::new(),
         };
         me.detect_workspace();
         me
@@ -180,6 +205,9 @@ impl App {
         self.question = question.to_string();
         self.mode = Mode::Panes;
         let (h, w) = pane_size(area, self.panes.len());
+        for p in self.panes.iter_mut() {
+            p.closed = false;
+        }
 
         let mut failed = Vec::new();
         for p in self.panes.iter_mut() {
@@ -195,7 +223,7 @@ impl App {
             }
         }
         self.status = if failed.is_empty() {
-            "Alt+←/→ 패널 이동 · Alt+1/2/3 직접 선택 · Ctrl+] 다음 n 새 질문, q 종료".into()
+            "클릭·Alt+←/→ 패널 이동 · [x] 닫기 · Ctrl+] 다음 n 새 질문, q 종료".into()
         } else {
             format!("기동 실패 — {}", failed.join(", "))
         };
@@ -203,7 +231,19 @@ impl App {
 
     /// 살아 있는 세션의 출력을 먹이고, 준비된 칸에 프롬프트를 넣는다.
     pub fn tick(&mut self) {
+        self.procs.refresh_if_stale();
         for p in self.panes.iter_mut() {
+            // 서브에이전트 — 에이전트가 띄운 자식 프로세스를 관측한다.
+            p.subagents = match p.session.as_ref().and_then(|s| s.pid()) {
+                Some(pid) => self
+                    .procs
+                    .descendants(pid)
+                    .into_iter()
+                    .map(|c| (c, self.procs.name(c)))
+                    .filter(|(_, n)| !n.is_empty())
+                    .collect(),
+                None => Vec::new(),
+            };
             if let Some(s) = p.session.as_mut() {
                 s.pump();
             }
@@ -220,6 +260,47 @@ impl App {
         }
     }
 
+    /// 열려 있는 칸의 인덱스 목록.
+    pub fn open_indices(&self) -> Vec<usize> {
+        (0..self.panes.len()).filter(|&i| !self.panes[i].closed).collect()
+    }
+
+    /// 칸을 닫는다. 자식 프로세스도 정리한다.
+    pub fn close_pane(&mut self, i: usize) {
+        if let Some(p) = self.panes.get_mut(i) {
+            if let Some(s) = p.session.as_mut() {
+                s.kill();
+            }
+            p.session = None;
+            p.closed = true;
+            p.subagents.clear();
+        }
+        // 포커스가 닫힌 칸을 가리키면 옆으로 옮긴다.
+        let open = self.open_indices();
+        if !open.contains(&self.focus) {
+            self.focus = open.first().copied().unwrap_or(0);
+        }
+        if open.is_empty() {
+            self.mode = Mode::Idle;
+            self.input.clear();
+        }
+    }
+
+    /// 클릭 지점이 어느 칸인지. 닫기 버튼이면 그것부터 판정한다.
+    pub fn hit_test(&self, x: u16, y: u16) -> Option<Hit> {
+        for (i, r) in &self.close_btn {
+            if contains(r, x, y) {
+                return Some(Hit::Close(*i));
+            }
+        }
+        for (i, r) in &self.hit {
+            if contains(r, x, y) {
+                return Some(Hit::Focus(*i));
+            }
+        }
+        None
+    }
+
     pub fn focused(&mut self) -> Option<&mut PtySession> {
         self.panes.get_mut(self.focus).and_then(|p| p.session.as_mut())
     }
@@ -227,7 +308,7 @@ impl App {
     /// 화면 크기가 바뀌면 각 PTY 도 자기 칸 크기로 맞춘다. 안 맞추면 자식이
     /// 자기 화면을 잘못 그린다.
     pub fn sync_sizes(&mut self, area: Rect) {
-        let (h, w) = pane_size(area, self.panes.len());
+        let (h, w) = pane_size(area, self.open_indices().len());
         for p in self.panes.iter_mut() {
             if p.size != (h, w) {
                 if let Some(s) = p.session.as_mut() {
@@ -328,23 +409,44 @@ impl App {
             .split(vert[1]);
         crate::sidebar::draw(f, main[0], self);
 
-        let n = self.panes.len().max(1);
+        // 닫힌 칸은 배치에서 빠진다. 남은 칸이 그만큼 넓어진다.
+        let open = self.open_indices();
+        let n = open.len().max(1);
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(vec![Constraint::Ratio(1, n as u32); n])
             .split(main[1]);
 
+        self.hit.clear();
+        self.close_btn.clear();
         let focus = self.focus;
-        for (i, p) in self.panes.iter().enumerate() {
+        for (slot, &i) in open.iter().enumerate() {
+            let p = &self.panes[i];
+            let area = cols[slot];
             let focused = i == focus;
             let border = if focused { Color::Cyan } else { Color::DarkGray };
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(if focused { BorderType::Thick } else { BorderType::Plain })
                 .border_style(Style::default().fg(border))
-                .title(format!(" {} [{}] ", p.title, p.status()));
-            let inner = block.inner(cols[i]);
-            f.render_widget(block, cols[i]);
+                .title(format!(" {} ", p.title));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            // 닫기 버튼 — 테두리 오른쪽 위. 클릭 대상이라 위치를 기억해 둔다.
+            if area.width >= 6 {
+                let btn = Rect { x: area.right().saturating_sub(4), y: area.y, width: 3, height: 1 };
+                f.render_widget(
+                    Paragraph::new("[x]").style(Style::default().fg(if focused {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGray
+                    })),
+                    btn,
+                );
+                self.close_btn.push((i, btn));
+            }
+            self.hit.push((i, area));
 
             if let Some(s) = p.session.as_ref() {
                 let screen = s.screen();
