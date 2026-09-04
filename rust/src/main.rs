@@ -14,7 +14,8 @@
 //!   multi_ai_cli --selftest    PTY+VT 파이프라인 자동 점검
 
 mod app;
-mod procs;
+mod model;
+mod subagents;
 mod converge;
 mod room;
 mod sidebar;
@@ -58,6 +59,39 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--selftest") => return selftest(),
+        Some("--subs") => {
+            // 서브에이전트 명부를 화면에서 읽어내는지 확인한다.
+            //
+            // 프로세스 트리로는 못 본다는 것이 실측으로 확인됐다 — 서브에이전트
+            // 둘을 끝까지 돌려도 자손 프로세스는 늘지 않았다. 에이전트가 자기
+            // 화면 아래에 그리는 명부가 유일한 관측 지점이다.
+            let agent = args.get(1).cloned().unwrap_or_else(|| "claude".into());
+            let prompt = args.get(2).cloned();
+            let secs: u64 = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(60);
+            let mut s = pty::PtySession::spawn(&agent, 40, 120)?;
+            let mut sent = false;
+            for i in 0..secs {
+                std::thread::sleep(Duration::from_secs(1));
+                s.pump();
+                if !sent && i >= 8 {
+                    if let Some(p) = &prompt {
+                        let _ = s.write(p.as_bytes());
+                        std::thread::sleep(Duration::from_millis(150));
+                        let _ = s.write(&[13]);
+                        outln!("-- 프롬프트 주입 --");
+                    }
+                    sent = true;
+                }
+                let subs = subagents::scan(&s.screen());
+                if !subs.is_empty() {
+                    outln!("{i:3}s  서브에이전트 {}개", subs.len());
+                    for b in &subs {
+                        outln!("      {} {} [{}]", b.kind, b.desc, if b.running { "도는 중" } else { "끝" });
+                    }
+                }
+            }
+            return Ok(());
+        }
         Some("--rooms") => {
             let rooms = room::list();
             if rooms.is_empty() {
@@ -177,6 +211,8 @@ fn run(term: &mut Term) -> Result<()> {
                 match app.mode {
                     Mode::Idle => on_key_idle(&mut app, k, term)?,
                     Mode::Panes => on_key_panes(&mut app, k)?,
+                    Mode::Picker => on_key_picker(&mut app, k, term)?,
+                    Mode::NewSpace => on_key_new_space(&mut app, k)?,
                 }
             }
             Event::Mouse(m) => on_mouse(&mut app, m),
@@ -211,6 +247,50 @@ fn on_key_idle(app: &mut App, k: KeyEvent, term: &mut Term) -> Result<()> {
     Ok(())
 }
 
+/// `+` 선택 상자 — 어떤 에이전트를 띄울지 고른다.
+fn on_key_picker(app: &mut App, k: KeyEvent, term: &mut Term) -> Result<()> {
+    match k.code {
+        KeyCode::Esc => app.mode = if app.visible().is_empty() { Mode::Idle } else { Mode::Panes },
+        KeyCode::Char(c @ '1'..='9') => {
+            let i = c as usize - '1' as usize;
+            if let Some((id, _)) = app.agents.get(i).cloned() {
+                let a = term.size()?;
+                app.mode = Mode::Panes;
+                app.spawn_session(&id, ratatui::layout::Rect::new(0, 0, a.width, a.height), None);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// 새 공간 경로 입력.
+fn on_key_new_space(app: &mut App, k: KeyEvent) -> Result<()> {
+    match k.code {
+        KeyCode::Esc => {
+            app.input.clear();
+            app.mode = if app.visible().is_empty() { Mode::Idle } else { Mode::Panes };
+        }
+        KeyCode::Enter => {
+            let path = app.input.trim().to_string();
+            match app.add_space(&path) {
+                Ok(()) => {
+                    app.input.clear();
+                    app.status = app::HINT.into();
+                }
+                // 경로가 틀렸으면 입력을 지우지 않는다. 고쳐 쓰게 둔다.
+                Err(e) => app.status = e,
+            }
+        }
+        KeyCode::Backspace => {
+            app.input.pop();
+        }
+        KeyCode::Char(c) => app.input.push(c),
+        _ => {}
+    }
+    Ok(())
+}
+
 /// 패널 화면 — 키는 포커스된 자식에게 그대로 간다.
 ///
 /// 우리 조작은 프리픽스(Ctrl+]) 뒤에 온다. 그러지 않으면 에이전트가 쓰는 키를
@@ -219,12 +299,7 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
     if app.prefix {
         app.prefix = false;
         match k.code {
-            KeyCode::Char(c @ '1'..='9') => {
-                let i = c as usize - '1' as usize;
-                if i < app.panes.len() {
-                    app.focus = i;
-                }
-            }
+            KeyCode::Char(c @ '1'..='9') => app.focus_nth(c as usize - '1' as usize),
             KeyCode::Char('n') => {
                 app.mode = Mode::Idle;
                 app.input.clear();
@@ -244,25 +319,17 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
     // Alt+화살표 / Alt+숫자로 바로 이동한다. 프리픽스보다 빠르고,
     // 에이전트 TUI 들이 Alt+방향키를 거의 쓰지 않아 충돌이 적다.
     if k.modifiers.contains(KeyModifiers::ALT) {
-        let n = app.panes.len();
         match k.code {
             KeyCode::Left => {
-                if n > 0 {
-                    app.focus = (app.focus + n - 1) % n;
-                }
+                app.cycle_focus(-1);
                 return Ok(());
             }
             KeyCode::Right => {
-                if n > 0 {
-                    app.focus = (app.focus + 1) % n;
-                }
+                app.cycle_focus(1);
                 return Ok(());
             }
             KeyCode::Char(c @ '1'..='9') => {
-                let i = c as usize - '1' as usize;
-                if i < n {
-                    app.focus = i;
-                }
+                app.focus_nth(c as usize - '1' as usize);
                 return Ok(());
             }
             _ => {}
@@ -287,12 +354,28 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
 /// 마우스는 우리가 먹는다. 자식에게 넘기면 에이전트가 자기 좌표계로 해석해
 /// 엉뚱한 곳을 누른 것이 된다 — 패널마다 원점이 다르기 때문이다.
 fn on_mouse(app: &mut App, m: MouseEvent) {
-    if !matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-        return;
+    // 휠은 사이드바 스크롤에 쓴다. 커서가 놓인 칸만 움직인다.
+    match m.kind {
+        MouseEventKind::ScrollUp => {
+            app.scroll(m.column, m.row, -1);
+            return;
+        }
+        MouseEventKind::ScrollDown => {
+            app.scroll(m.column, m.row, 1);
+            return;
+        }
+        MouseEventKind::Down(MouseButton::Left) => {}
+        _ => return,
     }
     match app.hit_test(m.column, m.row) {
-        Some(Hit::Close(i)) => app.close_pane(i),
+        Some(Hit::Close(i)) => app.close_session(i),
         Some(Hit::Focus(i)) => app.focus = i,
+        Some(Hit::Space(i)) => app.select_space(i),
+        Some(Hit::AddSpace) => {
+            app.input = app.active_path().to_string_lossy().into_owned();
+            app.mode = Mode::NewSpace;
+        }
+        Some(Hit::AddSession) => app.mode = Mode::Picker,
         None => {}
     }
 }
@@ -491,11 +574,21 @@ fn selftest() -> Result<()> {
 
     let mut s = pty::PtySession::spawn_raw(&prog, &argrefs, 24, 80)?;
 
+    // 자식이 끝나도 PTY 버퍼에 아직 안 읽은 출력이 남아 있다. 종료를 보자마자
+    // 단정하면 절반만 읽고 실패한다(실측 — 91/110 바이트에서 실패). 그래서
+    // **출력이 잠잠해질 때까지** 더 읽는다.
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let mut quiet_since = None;
     while std::time::Instant::now() < deadline {
+        let before = s.rx_bytes;
         s.pump();
-        if s.finished() {
-            break;
+        if s.rx_bytes != before {
+            quiet_since = None;
+        } else if s.finished() {
+            let t = *quiet_since.get_or_insert(std::time::Instant::now());
+            if t.elapsed() >= Duration::from_millis(300) {
+                break;
+            }
         }
         std::thread::sleep(Duration::from_millis(30));
     }

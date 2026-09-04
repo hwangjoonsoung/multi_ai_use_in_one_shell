@@ -1,0 +1,133 @@
+//! 작업 공간과 세션. 구조 변경의 뼈대다.
+//!
+//! 이전에는 「고정 참여자 3인 × 워크스페이스 1개」였다. 이제는
+//!
+//!   Space (경로)
+//!     ├─ Session (에이전트 + PTY)
+//!     ├─ Session
+//!     └─ …
+//!
+//! 로 바뀐다. 공간을 고르면 그 공간의 세션만 보이고, 새 세션은 그 공간의
+//! 경로에서 뜬다.
+
+use crate::pty::PtySession;
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+
+pub struct Space {
+    pub path: PathBuf,
+    pub name: String,
+}
+
+impl Space {
+    pub fn new(path: PathBuf) -> Self {
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        Self { path, name }
+    }
+}
+
+/// 세션 상태. **관측 가능한 사실만** 표현한다.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    Starting,
+    Working,
+    Quiet,
+    Exited,
+}
+
+impl State {
+    pub fn color(self) -> ratatui::style::Color {
+        use ratatui::style::Color;
+        match self {
+            State::Starting => Color::Yellow,
+            State::Working => Color::Green,
+            State::Quiet => Color::Cyan,
+            State::Exited => Color::Red,
+        }
+    }
+}
+
+pub struct Session {
+    pub agent_id: String,
+    pub title: String,
+    /// 어느 공간에 속하는가 (spaces 인덱스)
+    pub space: usize,
+    pub pty: Option<PtySession>,
+    /// 마지막으로 맞춘 크기. 달라졌을 때만 resize 한다.
+    pub size: (u16, u16),
+    /// 아직 넣지 못한 프롬프트
+    pub pending: Option<String>,
+    pub started: Option<Instant>,
+    /// 마지막으로 본 수신 바이트 수와 그 시각
+    pub seen: (usize, Instant),
+    /// 화면에서 읽어낸 서브에이전트 명부. 화면이 바뀔 때만 갱신한다.
+    pub subs: Vec<crate::subagents::Sub>,
+}
+
+impl Session {
+    pub fn new(agent_id: &str, title: &str, space: usize) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            title: title.into(),
+            space,
+            pty: None,
+            size: (0, 0),
+            pending: None,
+            started: None,
+            seen: (0, Instant::now()),
+            subs: Vec::new(),
+        }
+    }
+
+    /// 화면에서 서브에이전트 명부를 다시 읽는다.
+    ///
+    /// 매 프레임 전체 화면을 훑는 것은 낭비라 **새 출력이 있을 때만** 한다.
+    pub fn refresh_subs(&mut self, changed: bool) {
+        if !changed {
+            return;
+        }
+        self.subs = match self.pty.as_ref() {
+            Some(p) => crate::subagents::scan(&p.screen()),
+            None => Vec::new(),
+        };
+    }
+
+    pub fn state(&self) -> State {
+        match &self.pty {
+            None => State::Exited,
+            Some(s) if s.finished() => State::Exited,
+            Some(_) if self.pending.is_some() => State::Starting,
+            Some(_) => {
+                if self.seen.1.elapsed() < Duration::from_millis(800) {
+                    State::Working
+                } else {
+                    State::Quiet
+                }
+            }
+        }
+    }
+
+    /// 프롬프트를 넣어도 되는 상태인가.
+    ///
+    /// 에이전트마다 기동 속도가 크게 다르다. 고정 지연으로는 빠른 쪽엔 낭비,
+    /// 느린 쪽엔 입력이 삼켜진다. **출력이 한 번 나온 뒤 잠잠해지면** 준비로 본다.
+    pub fn ready_to_inject(&mut self) -> bool {
+        let Some(s) = self.pty.as_ref() else { return false };
+        let Some(started) = self.started else { return false };
+        let rx = s.rx_bytes;
+        if rx != self.seen.0 {
+            self.seen = (rx, Instant::now());
+            return false;
+        }
+        if rx == 0 {
+            return started.elapsed() >= Duration::from_secs(20);
+        }
+        self.seen.1.elapsed() >= Duration::from_millis(600)
+            || started.elapsed() >= Duration::from_secs(20)
+    }
+}

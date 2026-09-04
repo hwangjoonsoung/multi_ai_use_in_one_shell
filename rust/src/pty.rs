@@ -28,8 +28,17 @@ pub struct PtySession {
 }
 
 impl PtySession {
-    /// 에이전트를 PTY 안에서 기동한다. 크기는 화면과 같아야 한다.
+    /// 에이전트를 현재 디렉터리에서 기동한다.
     pub fn spawn(agent: &str, rows: u16, cols: u16) -> Result<Self> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        Self::spawn_in(agent, rows, cols, &cwd)
+    }
+
+    /// 에이전트를 **주어진 경로에서** 기동한다. 크기는 화면과 같아야 한다.
+    ///
+    /// 공간(space)마다 경로가 다르므로 작업 디렉터리를 인자로 받는다.
+    /// 에이전트는 cwd 를 기준으로 파일을 찾으므로 이게 곧 「어느 프로젝트인가」다.
+    pub fn spawn_in(agent: &str, rows: u16, cols: u16, cwd: &std::path::Path) -> Result<Self> {
         let (exe, prefix) = resolve_agent(agent)
             .ok_or_else(|| anyhow!("실행 파일을 찾지 못했다: {agent}"))?;
 
@@ -42,9 +51,7 @@ impl PtySession {
         for a in &prefix {
             cmd.arg(a);
         }
-        if let Ok(cwd) = std::env::current_dir() {
-            cmd.cwd(cwd);
-        }
+        cmd.cwd(cwd);
         // Claude Code 세션 식별 변수를 물려주지 않는다. 중첩 실행 시 혼동을 막는다.
         for k in ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_SESSION_ID"] {
             cmd.env_remove(k);

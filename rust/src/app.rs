@@ -1,299 +1,327 @@
-//! 앱 상태와 이벤트 루프. R2 — 에이전트 셋을 각각 PTY 에 띄우고 패널로 나눈다.
+//! 앱 상태와 화면. 「공간 × 세션」 구조다.
 //!
-//! 화면은 두 가지다.
-//!   Idle  — 질문 입력만 있는 시작 화면
-//!   Panes — 참여자마다 자기 칸. 그 안은 에이전트의 실제 TUI 다.
+//! 화면 모드
+//!   Idle     — 질문 입력만 있는 시작 화면
+//!   Panes    — 선택된 공간의 세션들. 그 안은 에이전트의 실제 TUI 다.
+//!   Picker   — `+` 를 눌러 어떤 에이전트를 띄울지 고르는 중
+//!   NewSpace — 새 공간의 경로를 입력하는 중
 //!
-//! 키는 기본적으로 **포커스된 패널의 자식에게 그대로** 간다. 그래야 권한 승인·
+//! 키는 기본적으로 **포커스된 세션의 자식에게 그대로** 간다. 그래야 권한 승인·
 //! 슬래시 자동완성·esc 중단이 동작한다. 우리 조작은 tmux 처럼 프리픽스로 뺀다.
+//!
+//! 세션이 넷 이상이면 나란히 두지 않고 **탭**으로 바꾼다. 좁은 칸에 에이전트
+//! TUI 를 밀어 넣으면 자식이 자기 화면을 접어버려 읽을 수 없기 때문이다.
 
-use crate::{pty::PtySession, vtscreen::VtScreen};
+use crate::{
+    model::{Session, Space},
+    pty::PtySession,
+    vtscreen::VtScreen,
+};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
-use std::time::{Duration, Instant};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use unicode_width::UnicodeWidthStr;
 
-pub struct Pane {
-    pub id: String,
-    pub title: String,
-    pub session: Option<PtySession>,
-    /// 마지막으로 맞춰둔 크기. 달라졌을 때만 resize 한다.
-    size: (u16, u16),
-    /// 아직 넣지 못한 프롬프트. 이 칸이 준비되면 넣는다.
-    pending: Option<String>,
-    /// 기동 시각. 최대 대기 시간을 재는 기준.
-    started: Option<Instant>,
-    /// 마지막으로 관측한 수신 바이트 수와 그 시각. 출력이 멎으면 준비된 것으로 본다.
-    seen: (usize, Instant),
-    /// 사용자가 닫은 칸. 배치에서 빠진다.
-    pub closed: bool,
-    /// 이 에이전트가 띄운 자식 프로세스 (이름, PID)
-    pub subagents: Vec<(u32, String)>,
-}
-
-impl Pane {
-    fn new(id: &str, title: &str) -> Self {
-        Self {
-            id: id.into(),
-            title: title.into(),
-            session: None,
-            size: (0, 0),
-            pending: None,
-            started: None,
-            seen: (0, Instant::now()),
-            closed: false,
-            subagents: Vec::new(),
-        }
-    }
-
-    fn status(&self) -> &'static str {
-        self.state().label()
-    }
-
-    /// 지금 상태. 최근 출력 여부로 «출력 중»과 «멎음»을 가른다.
-    pub fn state(&self) -> PaneState {
-        match &self.session {
-            None => PaneState::Idle,
-            Some(s) if s.finished() => PaneState::Exited,
-            Some(_) if self.pending.is_some() => PaneState::Starting,
-            Some(_) => {
-                if self.seen.1.elapsed() < Duration::from_millis(800) {
-                    PaneState::Working
-                } else {
-                    PaneState::Quiet
-                }
-            }
-        }
-    }
-
-    /// 프롬프트를 넣어도 되는 상태인가.
-    ///
-    /// 에이전트마다 기동 속도가 크게 다르다(agy 는 모델 조회 때문에 느리다).
-    /// 고정 지연으로는 빠른 쪽엔 낭비, 느린 쪽엔 입력이 삼켜진다. 그래서
-    /// **출력이 한 번 나온 뒤 잠잠해지면** 준비된 것으로 본다.
-    fn ready_to_inject(&mut self) -> bool {
-        let Some(s) = self.session.as_ref() else { return false };
-        let Some(started) = self.started else { return false };
-        let rx = s.rx_bytes;
-        if rx != self.seen.0 {
-            self.seen = (rx, Instant::now());
-            return false;
-        }
-        // 아무것도 못 받았으면 아직 뜨는 중이다.
-        if rx == 0 {
-            return started.elapsed() >= Duration::from_secs(20);
-        }
-        // 출력이 멎고 600ms 지났거나, 20초를 넘겼으면 넣는다.
-        self.seen.1.elapsed() >= Duration::from_millis(600)
-            || started.elapsed() >= Duration::from_secs(20)
-    }
-}
-
-/// 패널 상태. **관측 가능한 사실만** 표현한다.
-///
-/// "무엇을 하는 중인지"는 우리가 알 수 없다. 프로세스가 살아 있는지, 최근에
-/// 출력이 있었는지만 안다. 그 이상을 추측해 표시하면 사용자를 오도한다.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum PaneState {
-    /// 아직 안 띄웠다
-    Idle,
-    /// 띄웠고 프롬프트 주입을 기다리는 중
-    Starting,
-    /// 최근에 출력이 있었다
-    Working,
-    /// 살아 있지만 잠잠하다
-    Quiet,
-    /// 프로세스가 끝났다
-    Exited,
-}
-
-impl PaneState {
-    pub fn label(self) -> &'static str {
-        match self {
-            PaneState::Idle => "대기",
-            PaneState::Starting => "기동 중",
-            PaneState::Working => "출력 중",
-            PaneState::Quiet => "멎음",
-            PaneState::Exited => "종료",
-        }
-    }
-}
-
-/// 마우스 클릭이 무엇을 가리키는가.
-pub enum Hit {
-    Focus(usize),
-    Close(usize),
-}
-
-fn contains(r: &Rect, x: u16, y: u16) -> bool {
-    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
-}
+/// 이보다 많아지면 나란히 두지 않고 탭으로 바꾼다.
+pub const MAX_SPLIT: usize = 3;
 
 pub enum Mode {
     Idle,
     Panes,
+    Picker,
+    NewSpace,
+}
+
+/// 마우스 클릭이 무엇을 가리키는가.
+pub enum Hit {
+    /// 세션에 포커스
+    Focus(usize),
+    /// 세션 닫기
+    Close(usize),
+    /// 공간 선택
+    Space(usize),
+    /// 새 공간 추가
+    AddSpace,
+    /// 새 세션 추가 (+)
+    AddSession,
 }
 
 pub struct App {
-    pub panes: Vec<Pane>,
+    /// 띄울 수 있는 에이전트 (id, 표시명)
+    pub agents: Vec<(String, String)>,
+
+    pub spaces: Vec<Space>,
+    pub active_space: usize,
+    pub sessions: Vec<Session>,
+    /// 포커스된 세션 (sessions 의 전역 인덱스)
     pub focus: usize,
+
     pub mode: Mode,
-    /// 시작 화면에서 타이핑 중인 질문
+    /// 시작 화면·공간 추가에서 타이핑 중인 문자열
     pub input: String,
-    pub question: String,
     pub status: String,
-    /// 프리픽스를 누른 직후인가. 다음 키를 우리 명령으로 해석한다.
     pub prefix: bool,
     pub quit: bool,
-    /// 사이드바에 보일 작업 공간 정보
-    pub workspace_name: String,
-    pub workspace_path: String,
-    pub branch: String,
-    /// 서브에이전트 조회. 초당 1회만 실제로 훑는다.
-    procs: crate::procs::Tree,
-    /// 마지막 렌더의 칸 위치. 마우스 클릭을 어느 칸으로 보낼지 판정한다.
-    hit: Vec<(usize, Rect)>,
-    /// 닫기 버튼 위치.
-    close_btn: Vec<(usize, Rect)>,
+
+    /// 사이드바 스크롤 오프셋 (줄 단위)
+    pub space_scroll: u16,
+    pub agent_scroll: u16,
+
+    // ---- 마지막 렌더의 클릭 대상. 마우스 판정에 쓴다. ----
+    pane_hit: Vec<(usize, Rect)>,
+    close_hit: Vec<(usize, Rect)>,
+    space_hit: Vec<(usize, Rect)>,
+    agent_hit: Vec<(usize, Rect)>,
+    add_space_hit: Option<Rect>,
+    add_session_hit: Option<Rect>,
+    /// 사이드바의 두 칸 영역. 휠 스크롤을 어디에 적용할지 가른다.
+    spaces_area: Rect,
+    agents_area: Rect,
 }
 
 impl App {
     pub fn new(agents: &[(&str, &str)]) -> Self {
-        let mut me = Self {
-            panes: agents.iter().map(|(id, t)| Pane::new(id, t)).collect(),
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self {
+            agents: agents.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(),
+            spaces: vec![Space::new(cwd)],
+            active_space: 0,
+            sessions: Vec::new(),
             focus: 0,
             mode: Mode::Idle,
             input: String::new(),
-            question: String::new(),
             status: String::new(),
             prefix: false,
             quit: false,
-            workspace_name: String::new(),
-            workspace_path: String::new(),
-            branch: String::new(),
-            procs: crate::procs::Tree::new(),
-            hit: Vec::new(),
-            close_btn: Vec::new(),
-        };
-        me.detect_workspace();
-        me
+            space_scroll: 0,
+            agent_scroll: 0,
+            pane_hit: Vec::new(),
+            close_hit: Vec::new(),
+            space_hit: Vec::new(),
+            agent_hit: Vec::new(),
+            add_space_hit: None,
+            add_session_hit: None,
+            spaces_area: Rect::ZERO,
+            agents_area: Rect::ZERO,
+        }
     }
 
-    /// 현재 디렉터리 이름과 git 브랜치를 읽는다.
-    ///
-    /// 브랜치는 .git/HEAD 를 직접 읽는다. git 프로세스를 띄우면 매 프레임
-    /// 비용이 들고, 우리가 필요한 건 한 줄뿐이다.
-    fn detect_workspace(&mut self) {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        self.workspace_name = cwd
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "-".into());
-        self.workspace_path = cwd.to_string_lossy().into_owned();
-        self.branch = read_branch(&cwd).unwrap_or_default();
+    pub fn active_path(&self) -> PathBuf {
+        self.spaces
+            .get(self.active_space)
+            .map(|s| s.path.clone())
+            .unwrap_or_default()
     }
 
-    /// 질문을 확정하고 참여자들을 PTY 에 띄운다.
+    /// 지금 보이는 세션들 — 선택된 공간에 속한 것만.
     ///
-    /// 프롬프트는 기동 인자가 아니라 **키 입력으로 주입한다.** 대화형 세션이라
-    /// 그래야 하고, 덕분에 Windows 명령행 길이 한계도 걸리지 않는다.
+    /// 공간을 바꾸면 다른 공간의 세션은 **죽이지 않고 숨긴다.** 돌아오면 그대로다.
+    pub fn visible(&self) -> Vec<usize> {
+        (0..self.sessions.len())
+            .filter(|&i| self.sessions[i].space == self.active_space)
+            .collect()
+    }
+
+    /// 탭 모드인가 — 보이는 세션이 MAX_SPLIT 을 넘는가.
+    pub fn tabbed(&self) -> bool {
+        self.visible().len() > MAX_SPLIT
+    }
+
+    // ---------- 공간 ----------
+
+    pub fn add_space(&mut self, path: &str) -> Result<(), String> {
+        let p = PathBuf::from(path.trim());
+        if !p.is_dir() {
+            return Err(format!("디렉터리가 아니다: {}", p.display()));
+        }
+        let p = p.canonicalize().unwrap_or(p);
+        if let Some(i) = self.spaces.iter().position(|s| s.path == p) {
+            self.select_space(i);
+            return Ok(());
+        }
+        self.spaces.push(Space::new(p));
+        self.select_space(self.spaces.len() - 1);
+        Ok(())
+    }
+
+    /// 공간을 고른다. 그 공간의 세션이 보이고, 포커스도 그 안으로 옮긴다.
+    pub fn select_space(&mut self, i: usize) {
+        if i >= self.spaces.len() {
+            return;
+        }
+        self.active_space = i;
+        self.agent_scroll = 0;
+        let vis = self.visible();
+        if !vis.contains(&self.focus) {
+            self.focus = vis.first().copied().unwrap_or(0);
+        }
+        self.mode = if vis.is_empty() { Mode::Idle } else { Mode::Panes };
+    }
+
+    // ---------- 세션 ----------
+
+    /// 지금 공간에서 에이전트 하나를 띄운다.
+    pub fn spawn_session(&mut self, agent_id: &str, area: Rect, prompt: Option<&str>) {
+        let title = self
+            .agents
+            .iter()
+            .find(|(id, _)| id == agent_id)
+            .map(|(_, t)| t.clone())
+            .unwrap_or_else(|| agent_id.to_string());
+
+        let n = (self.visible().len() + 1).min(MAX_SPLIT);
+        let (h, w) = pane_size(area, n);
+        let cwd = self.active_path();
+
+        let mut s = Session::new(agent_id, &title, self.active_space);
+        match PtySession::spawn_in(agent_id, h, w, &cwd) {
+            Ok(pty) => {
+                s.pty = Some(pty);
+                s.size = (h, w);
+                s.pending = prompt.map(String::from);
+                s.started = Some(Instant::now());
+                s.seen = (0, Instant::now());
+                self.sessions.push(s);
+                self.focus = self.sessions.len() - 1;
+                self.mode = Mode::Panes;
+            }
+            Err(e) => self.status = format!("{title} 기동 실패 — {e}"),
+        }
+    }
+
+    /// 시작 화면의 질문으로 **모든 에이전트**를 한 번에 띄운다.
     pub fn start_round(&mut self, question: &str, area: Rect) {
-        self.question = question.to_string();
-        self.mode = Mode::Panes;
-        let (h, w) = pane_size(area, self.panes.len());
-        for p in self.panes.iter_mut() {
-            p.closed = false;
+        let ids: Vec<String> = self.agents.iter().map(|(id, _)| id.clone()).collect();
+        for id in ids {
+            self.spawn_session(&id, area, Some(question));
         }
-
-        let mut failed = Vec::new();
-        for p in self.panes.iter_mut() {
-            match PtySession::spawn(&p.id, h, w) {
-                Ok(s) => {
-                    p.session = Some(s);
-                    p.size = (h, w);
-                    p.pending = Some(question.to_string());
-                    p.started = Some(Instant::now());
-                    p.seen = (0, Instant::now());
-                }
-                Err(e) => failed.push(format!("{}: {}", p.title, e)),
-            }
-        }
-        self.status = if failed.is_empty() {
-            "클릭·Alt+←/→ 패널 이동 · [x] 닫기 · Ctrl+] 다음 n 새 질문, q 종료".into()
-        } else {
-            format!("기동 실패 — {}", failed.join(", "))
-        };
-    }
-
-    /// 살아 있는 세션의 출력을 먹이고, 준비된 칸에 프롬프트를 넣는다.
-    pub fn tick(&mut self) {
-        self.procs.refresh_if_stale();
-        for p in self.panes.iter_mut() {
-            // 서브에이전트 — 에이전트가 띄운 자식 프로세스를 관측한다.
-            p.subagents = match p.session.as_ref().and_then(|s| s.pid()) {
-                Some(pid) => self
-                    .procs
-                    .descendants(pid)
-                    .into_iter()
-                    .map(|c| (c, self.procs.name(c)))
-                    .filter(|(_, n)| !n.is_empty())
-                    .collect(),
-                None => Vec::new(),
-            };
-            if let Some(s) = p.session.as_mut() {
-                s.pump();
-            }
-            if p.pending.is_some() && p.ready_to_inject() {
-                let text = p.pending.take().unwrap_or_default();
-                if let Some(s) = p.session.as_mut() {
-                    let _ = s.write(text.as_bytes());
-                    // 개행은 살짝 뒤에 보낸다. 붙여 보내면 입력창이 아직 다 안
-                    // 그려진 에이전트에서 첫 글자가 잘린다.
-                    std::thread::sleep(Duration::from_millis(120));
-                    let _ = s.write(&[13]);
-                }
-            }
+        let vis = self.visible();
+        self.focus = vis.first().copied().unwrap_or(0);
+        if self.status.is_empty() {
+            self.status = HINT.into();
         }
     }
 
-    /// 열려 있는 칸의 인덱스 목록.
-    pub fn open_indices(&self) -> Vec<usize> {
-        (0..self.panes.len()).filter(|&i| !self.panes[i].closed).collect()
-    }
-
-    /// 칸을 닫는다. 자식 프로세스도 정리한다.
-    pub fn close_pane(&mut self, i: usize) {
-        if let Some(p) = self.panes.get_mut(i) {
-            if let Some(s) = p.session.as_mut() {
-                s.kill();
-            }
-            p.session = None;
-            p.closed = true;
-            p.subagents.clear();
+    /// 세션을 닫는다. 자식 프로세스도 정리하고 목록에서 뺀다.
+    pub fn close_session(&mut self, i: usize) {
+        if i >= self.sessions.len() {
+            return;
         }
-        // 포커스가 닫힌 칸을 가리키면 옆으로 옮긴다.
-        let open = self.open_indices();
-        if !open.contains(&self.focus) {
-            self.focus = open.first().copied().unwrap_or(0);
+        if let Some(p) = self.sessions[i].pty.as_mut() {
+            p.kill();
         }
-        if open.is_empty() {
+        self.sessions.remove(i);
+        // 뒤 인덱스가 한 칸씩 당겨졌다. 포커스를 보정한다.
+        if self.focus > i {
+            self.focus -= 1;
+        }
+        let vis = self.visible();
+        if !vis.contains(&self.focus) {
+            self.focus = vis.first().copied().unwrap_or(0);
+        }
+        if vis.is_empty() {
             self.mode = Mode::Idle;
             self.input.clear();
         }
     }
 
-    /// 클릭 지점이 어느 칸인지. 닫기 버튼이면 그것부터 판정한다.
+    /// 보이는 세션 안에서 포커스를 옮긴다.
+    pub fn cycle_focus(&mut self, delta: i32) {
+        let vis = self.visible();
+        if vis.is_empty() {
+            return;
+        }
+        let cur = vis.iter().position(|&i| i == self.focus).unwrap_or(0) as i32;
+        let n = vis.len() as i32;
+        self.focus = vis[(((cur + delta) % n + n) % n) as usize];
+    }
+
+    /// 보이는 세션 중 n 번째로 포커스.
+    pub fn focus_nth(&mut self, n: usize) {
+        if let Some(&i) = self.visible().get(n) {
+            self.focus = i;
+        }
+    }
+
+    pub fn focused(&mut self) -> Option<&mut PtySession> {
+        self.sessions.get_mut(self.focus).and_then(|s| s.pty.as_mut())
+    }
+
+    /// 살아 있는 세션의 출력을 먹이고, 준비된 세션에 프롬프트를 넣는다.
+    pub fn tick(&mut self) {
+        for s in self.sessions.iter_mut() {
+            let before = s.pty.as_ref().map(|p| p.rx_bytes).unwrap_or(0);
+            if let Some(p) = s.pty.as_mut() {
+                p.pump();
+            }
+            let after = s.pty.as_ref().map(|p| p.rx_bytes).unwrap_or(0);
+            s.refresh_subs(after != before);
+            if s.pending.is_some() && s.ready_to_inject() {
+                let text = s.pending.take().unwrap_or_default();
+                if let Some(p) = s.pty.as_mut() {
+                    let _ = p.write(text.as_bytes());
+                    // 개행은 살짝 뒤에. 붙여 보내면 입력창이 아직 다 안 그려진
+                    // 에이전트에서 첫 글자가 잘린다.
+                    std::thread::sleep(Duration::from_millis(120));
+                    let _ = p.write(&[13]);
+                }
+            }
+        }
+    }
+
+    /// 화면 크기가 바뀌면 각 PTY 도 자기 칸 크기로 맞춘다.
+    pub fn sync_sizes(&mut self, area: Rect) {
+        let n = if self.tabbed() { 1 } else { self.visible().len() };
+        let (h, w) = pane_size(area, n);
+        for i in self.visible() {
+            let s = &mut self.sessions[i];
+            if s.size != (h, w) {
+                if let Some(p) = s.pty.as_mut() {
+                    let _ = p.resize(h, w);
+                    s.size = (h, w);
+                }
+            }
+        }
+    }
+
+    // ---------- 마우스 ----------
+
     pub fn hit_test(&self, x: u16, y: u16) -> Option<Hit> {
-        for (i, r) in &self.close_btn {
+        if let Some(r) = &self.add_space_hit {
+            if contains(r, x, y) {
+                return Some(Hit::AddSpace);
+            }
+        }
+        if let Some(r) = &self.add_session_hit {
+            if contains(r, x, y) {
+                return Some(Hit::AddSession);
+            }
+        }
+        // 닫기 버튼이 패널 영역 안에 있으므로 먼저 본다.
+        for (i, r) in &self.close_hit {
             if contains(r, x, y) {
                 return Some(Hit::Close(*i));
             }
         }
-        for (i, r) in &self.hit {
+        for (i, r) in &self.space_hit {
+            if contains(r, x, y) {
+                return Some(Hit::Space(*i));
+            }
+        }
+        for (i, r) in &self.agent_hit {
+            if contains(r, x, y) {
+                return Some(Hit::Focus(*i));
+            }
+        }
+        for (i, r) in &self.pane_hit {
             if contains(r, x, y) {
                 return Some(Hit::Focus(*i));
             }
@@ -301,22 +329,19 @@ impl App {
         None
     }
 
-    pub fn focused(&mut self) -> Option<&mut PtySession> {
-        self.panes.get_mut(self.focus).and_then(|p| p.session.as_mut())
-    }
-
-    /// 화면 크기가 바뀌면 각 PTY 도 자기 칸 크기로 맞춘다. 안 맞추면 자식이
-    /// 자기 화면을 잘못 그린다.
-    pub fn sync_sizes(&mut self, area: Rect) {
-        let (h, w) = pane_size(area, self.open_indices().len());
-        for p in self.panes.iter_mut() {
-            if p.size != (h, w) {
-                if let Some(s) = p.session.as_mut() {
-                    let _ = s.resize(h, w);
-                    p.size = (h, w);
-                }
-            }
-        }
+    /// 휠 스크롤. 커서가 놓인 칸만 움직인다.
+    pub fn scroll(&mut self, x: u16, y: u16, delta: i32) {
+        let target = if contains(&self.spaces_area, x, y) {
+            Some((&mut self.space_scroll, self.spaces.len() + 1))
+        } else if contains(&self.agents_area, x, y) {
+            let n = self.visible().len();
+            Some((&mut self.agent_scroll, n))
+        } else {
+            None
+        };
+        let Some((off, total)) = target else { return };
+        let max = total.saturating_sub(1) as u16;
+        *off = ((*off as i32 + delta).clamp(0, max as i32)) as u16;
     }
 
     // ---------- 렌더 ----------
@@ -325,6 +350,14 @@ impl App {
         match self.mode {
             Mode::Idle => self.draw_idle(f),
             Mode::Panes => self.draw_panes(f),
+            Mode::Picker => {
+                self.draw_panes(f);
+                self.draw_picker(f);
+            }
+            Mode::NewSpace => {
+                self.draw_panes(f);
+                self.draw_new_space(f);
+            }
         }
     }
 
@@ -348,9 +381,8 @@ impl App {
                 .centered(),
             rows[1],
         );
-        let names: Vec<&str> = self.panes.iter().map(|p| p.title.as_str()).collect();
         f.render_widget(
-            Paragraph::new(names.join("  ·  "))
+            Paragraph::new(self.active_path().to_string_lossy().into_owned())
                 .style(Style::default().fg(Color::DarkGray))
                 .centered(),
             rows[2],
@@ -370,19 +402,7 @@ impl App {
         let inner = block.inner(box_area);
         f.render_widget(block, box_area);
         f.render_widget(Paragraph::new(self.input.as_str()), inner);
-
-        // 커서를 입력 끝에 둔다.
-        //
-        // 문자 수가 아니라 **표시 폭**으로 세야 한다. 한글은 한 글자가 두 칸을
-        // 차지하므로 chars().count() 로 재면 커서가 글자 수만큼만 가서 어긋난다.
-        let len = UnicodeWidthStr::width(self.input.as_str()) as u16;
-        let width = inner.width.max(1);
-        let cx = inner.x + len % width;
-        let cy = inner.y + len / width;
-        f.set_cursor_position((
-            cx.min(inner.right().saturating_sub(1)),
-            cy.min(inner.bottom().saturating_sub(1)),
-        ));
+        put_cursor(f, inner, &self.input);
     }
 
     fn draw_panes(&mut self, f: &mut Frame) {
@@ -392,64 +412,132 @@ impl App {
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(1)])
             .split(area);
 
+        // 최상단은 첫 질문이 아니라 **현재 공간의 경로**다.
+        // 질문은 각 에이전트 화면 안에 이미 남아 있고, 여기서 늘 필요한 정보는
+        // 「지금 어디서 돌고 있는가」다.
         f.render_widget(
-            Paragraph::new(self.question.as_str())
+            Paragraph::new(self.active_path().to_string_lossy().into_owned())
                 .style(Style::default().add_modifier(Modifier::BOLD))
                 .block(Block::default().borders(Borders::BOTTOM)),
             vert[0],
         );
 
-        // 왼쪽 사이드바 + 오른쪽 패널들
         let main = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(crate::sidebar::WIDTH),
-                Constraint::Min(20),
-            ])
+            .constraints([Constraint::Length(crate::sidebar::WIDTH), Constraint::Min(20)])
             .split(vert[1]);
         crate::sidebar::draw(f, main[0], self);
 
-        // 닫힌 칸은 배치에서 빠진다. 남은 칸이 그만큼 넓어진다.
-        let open = self.open_indices();
-        let n = open.len().max(1);
+        let right = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(3)])
+            .split(main[1]);
+        self.draw_tabbar(f, right[0]);
+        self.draw_bodies(f, right[1]);
+
+        let hint = if self.prefix {
+            "Ctrl+] 눌림 — n 새 질문 · q 종료 · 1..9 포커스".to_string()
+        } else {
+            self.status.clone()
+        };
+        f.render_widget(
+            Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+            vert[2],
+        );
+    }
+
+    /// 탭 줄. 세션 칩들과 끝의 `+`.
+    ///
+    /// 탭 모드가 아니어도 그린다 — `+` 가 늘 같은 자리에 있어야 찾기 쉽다.
+    fn draw_tabbar(&mut self, f: &mut Frame, area: Rect) {
+        self.add_session_hit = None;
+        let vis = self.visible();
+        let tabbed = vis.len() > MAX_SPLIT;
+
+        let mut spans: Vec<Span> = Vec::new();
+        let mut x = area.x;
+        for &i in &vis {
+            let s = &self.sessions[i];
+            let focused = i == self.focus;
+            let label = format!(" {} ", s.title);
+            let w = UnicodeWidthStr::width(label.as_str()) as u16;
+            let style = if focused {
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            spans.push(Span::styled(label, style));
+            spans.push(Span::raw(" "));
+            // 탭 모드에서는 이 칩이 유일한 전환 수단이다.
+            if tabbed && x + w <= area.right() {
+                self.pane_hit.push((i, Rect { x, y: area.y, width: w, height: 1 }));
+            }
+            x += w + 1;
+        }
+        // 새 세션 버튼
+        if x + 3 <= area.right() {
+            spans.push(Span::styled(
+                "[+]",
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ));
+            self.add_session_hit = Some(Rect { x, y: area.y, width: 3, height: 1 });
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    fn draw_bodies(&mut self, f: &mut Frame, area: Rect) {
+        let vis = self.visible();
+        self.close_hit.clear();
+        if vis.is_empty() {
+            f.render_widget(
+                Paragraph::new("세션이 없다. [+] 로 에이전트를 띄운다.")
+                    .style(Style::default().fg(Color::DarkGray)),
+                area,
+            );
+            return;
+        }
+
+        // 넷 이상이면 포커스된 하나만 크게. 셋 이하면 나란히.
+        let shown: Vec<usize> = if vis.len() > MAX_SPLIT {
+            vec![if vis.contains(&self.focus) { self.focus } else { vis[0] }]
+        } else {
+            self.pane_hit.clear();
+            vis.clone()
+        };
+        let n = shown.len().max(1);
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(vec![Constraint::Ratio(1, n as u32); n])
-            .split(main[1]);
+            .split(area);
 
-        self.hit.clear();
-        self.close_btn.clear();
-        let focus = self.focus;
-        for (slot, &i) in open.iter().enumerate() {
-            let p = &self.panes[i];
-            let area = cols[slot];
-            let focused = i == focus;
+        for (slot, &i) in shown.iter().enumerate() {
+            let s = &self.sessions[i];
+            let a = cols[slot];
+            let focused = i == self.focus;
             let border = if focused { Color::Cyan } else { Color::DarkGray };
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(if focused { BorderType::Thick } else { BorderType::Plain })
                 .border_style(Style::default().fg(border))
-                .title(format!(" {} ", p.title));
-            let inner = block.inner(area);
-            f.render_widget(block, area);
+                .title(format!(" {} ", s.title));
+            let inner = block.inner(a);
+            f.render_widget(block, a);
 
-            // 닫기 버튼 — 테두리 오른쪽 위. 클릭 대상이라 위치를 기억해 둔다.
-            if area.width >= 6 {
-                let btn = Rect { x: area.right().saturating_sub(4), y: area.y, width: 3, height: 1 };
+            if a.width >= 6 {
+                let btn = Rect { x: a.right().saturating_sub(4), y: a.y, width: 3, height: 1 };
                 f.render_widget(
-                    Paragraph::new("[x]").style(Style::default().fg(if focused {
-                        Color::Cyan
-                    } else {
-                        Color::DarkGray
-                    })),
+                    Paragraph::new("[x]")
+                        .style(Style::default().fg(if focused { Color::Cyan } else { Color::DarkGray })),
                     btn,
                 );
-                self.close_btn.push((i, btn));
+                self.close_hit.push((i, btn));
             }
-            self.hit.push((i, area));
+            if vis.len() <= MAX_SPLIT {
+                self.pane_hit.push((i, a));
+            }
 
-            if let Some(s) = p.session.as_ref() {
-                let screen = s.screen();
+            if let Some(p) = s.pty.as_ref() {
+                let screen = p.screen();
                 f.render_widget(VtScreen::new(&screen), inner);
                 if focused && !screen.hide_cursor() {
                     let (r, c) = screen.cursor_position();
@@ -460,36 +548,99 @@ impl App {
                 }
             }
         }
+    }
 
-        let hint = if self.prefix {
-            "Ctrl+] 눌림 — n 새 질문 · q 종료 · 1/2/3 포커스".to_string()
-        } else {
-            self.status.clone()
-        };
-        f.render_widget(
-            Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
-            vert[2],
-        );
+    /// `+` 를 눌렀을 때의 에이전트 선택 상자.
+    fn draw_picker(&self, f: &mut Frame) {
+        let area = f.area();
+        let h = self.agents.len() as u16 + 2;
+        let r = center(area, 40, h);
+        f.render_widget(Clear, r);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Green))
+            .title(" 어떤 에이전트를 띄울까 ");
+        let inner = block.inner(r);
+        f.render_widget(block, r);
+        let lines: Vec<Line> = self
+            .agents
+            .iter()
+            .enumerate()
+            .map(|(i, (_, t))| {
+                Line::from(vec![
+                    Span::styled(format!(" {} ", i + 1), Style::default().fg(Color::Green)),
+                    Span::raw(t.clone()),
+                ])
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// 새 공간 경로 입력 상자.
+    fn draw_new_space(&self, f: &mut Frame) {
+        let area = f.area();
+        let r = center(area, area.width.min(70), 3);
+        f.render_widget(Clear, r);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Green))
+            .title(" 새 공간 경로 (Enter 추가 · Esc 취소) ");
+        let inner = block.inner(r);
+        f.render_widget(block, r);
+        f.render_widget(Paragraph::new(self.input.as_str()), inner);
+        put_cursor(f, inner, &self.input);
+    }
+
+    // 사이드바가 자기 영역과 클릭 대상을 등록한다.
+    pub(crate) fn set_spaces_area(&mut self, r: Rect) {
+        self.spaces_area = r;
+        self.space_hit.clear();
+        self.add_space_hit = None;
+    }
+    pub(crate) fn set_agents_area(&mut self, r: Rect) {
+        self.agents_area = r;
+        self.agent_hit.clear();
+    }
+    pub(crate) fn push_space_hit(&mut self, i: usize, r: Rect) {
+        self.space_hit.push((i, r));
+    }
+    pub(crate) fn push_agent_hit(&mut self, i: usize, r: Rect) {
+        self.agent_hit.push((i, r));
+    }
+    pub(crate) fn set_add_space_hit(&mut self, r: Rect) {
+        self.add_space_hit = Some(r);
     }
 }
 
-/// .git/HEAD 에서 현재 브랜치 이름을 읽는다.
-fn read_branch(dir: &std::path::Path) -> Option<String> {
-    let mut cur = Some(dir);
-    while let Some(d) = cur {
-        let head = d.join(".git").join("HEAD");
-        if head.is_file() {
-            let text = std::fs::read_to_string(head).ok()?;
-            let t = text.trim();
-            return Some(match t.strip_prefix("ref: refs/heads/") {
-                Some(name) => name.to_string(),
-                // 분리된 HEAD 면 커밋 해시 앞부분만 보여준다.
-                None => format!("({})", &t[..t.len().min(7)]),
-            });
-        }
-        cur = d.parent();
+pub const HINT: &str =
+    "클릭 이동 · [x] 닫기 · [+] 세션 추가 · Alt+←/→ · Ctrl+] 다음 n 새 질문, q 종료";
+
+fn contains(r: &Rect, x: u16, y: u16) -> bool {
+    r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+fn center(area: Rect, w: u16, h: u16) -> Rect {
+    Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w.min(area.width),
+        height: h.min(area.height),
     }
-    None
+}
+
+/// 입력 끝에 커서를 둔다.
+///
+/// 문자 수가 아니라 **표시 폭**으로 센다. 한글은 한 글자가 두 칸을 차지하므로
+/// chars().count() 로 재면 커서가 글자 수만큼만 가서 어긋난다.
+fn put_cursor(f: &mut Frame, inner: Rect, text: &str) {
+    let len = UnicodeWidthStr::width(text) as u16;
+    let width = inner.width.max(1);
+    f.set_cursor_position((
+        (inner.x + len % width).min(inner.right().saturating_sub(1)),
+        (inner.y + len / width).min(inner.bottom().saturating_sub(1)),
+    ));
 }
 
 /// 패널 하나에 줄 PTY 크기. 테두리와 상하단 줄을 뺀 값이다.
@@ -497,6 +648,7 @@ fn pane_size(area: Rect, n: usize) -> (u16, u16) {
     let n = n.max(1) as u16;
     let usable = area.width.saturating_sub(crate::sidebar::WIDTH);
     let w = (usable / n).saturating_sub(2).max(20);
-    let h = area.height.saturating_sub(5).max(6);
+    // 상단 경로 2줄 + 탭 1줄 + 상태 1줄 + 테두리 2줄
+    let h = area.height.saturating_sub(6).max(6);
     (h, w)
 }
