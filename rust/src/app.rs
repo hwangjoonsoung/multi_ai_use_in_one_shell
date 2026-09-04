@@ -45,11 +45,22 @@ impl Pane {
     }
 
     fn status(&self) -> &'static str {
+        self.state().label()
+    }
+
+    /// 지금 상태. 최근 출력 여부로 «출력 중»과 «멎음»을 가른다.
+    pub fn state(&self) -> PaneState {
         match &self.session {
-            None => "대기",
-            Some(s) if s.finished() => "종료",
-            Some(_) if self.pending.is_some() => "기동 중",
-            Some(_) => "실행 중",
+            None => PaneState::Idle,
+            Some(s) if s.finished() => PaneState::Exited,
+            Some(_) if self.pending.is_some() => PaneState::Starting,
+            Some(_) => {
+                if self.seen.1.elapsed() < Duration::from_millis(800) {
+                    PaneState::Working
+                } else {
+                    PaneState::Quiet
+                }
+            }
         }
     }
 
@@ -76,6 +87,36 @@ impl Pane {
     }
 }
 
+/// 패널 상태. **관측 가능한 사실만** 표현한다.
+///
+/// "무엇을 하는 중인지"는 우리가 알 수 없다. 프로세스가 살아 있는지, 최근에
+/// 출력이 있었는지만 안다. 그 이상을 추측해 표시하면 사용자를 오도한다.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PaneState {
+    /// 아직 안 띄웠다
+    Idle,
+    /// 띄웠고 프롬프트 주입을 기다리는 중
+    Starting,
+    /// 최근에 출력이 있었다
+    Working,
+    /// 살아 있지만 잠잠하다
+    Quiet,
+    /// 프로세스가 끝났다
+    Exited,
+}
+
+impl PaneState {
+    pub fn label(self) -> &'static str {
+        match self {
+            PaneState::Idle => "대기",
+            PaneState::Starting => "기동 중",
+            PaneState::Working => "출력 중",
+            PaneState::Quiet => "멎음",
+            PaneState::Exited => "종료",
+        }
+    }
+}
+
 pub enum Mode {
     Idle,
     Panes,
@@ -92,11 +133,15 @@ pub struct App {
     /// 프리픽스를 누른 직후인가. 다음 키를 우리 명령으로 해석한다.
     pub prefix: bool,
     pub quit: bool,
+    /// 사이드바에 보일 작업 공간 정보
+    pub workspace_name: String,
+    pub workspace_path: String,
+    pub branch: String,
 }
 
 impl App {
     pub fn new(agents: &[(&str, &str)]) -> Self {
-        Self {
+        let mut me = Self {
             panes: agents.iter().map(|(id, t)| Pane::new(id, t)).collect(),
             focus: 0,
             mode: Mode::Idle,
@@ -105,7 +150,26 @@ impl App {
             status: String::new(),
             prefix: false,
             quit: false,
-        }
+            workspace_name: String::new(),
+            workspace_path: String::new(),
+            branch: String::new(),
+        };
+        me.detect_workspace();
+        me
+    }
+
+    /// 현재 디렉터리 이름과 git 브랜치를 읽는다.
+    ///
+    /// 브랜치는 .git/HEAD 를 직접 읽는다. git 프로세스를 띄우면 매 프레임
+    /// 비용이 들고, 우리가 필요한 건 한 줄뿐이다.
+    fn detect_workspace(&mut self) {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        self.workspace_name = cwd
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "-".into());
+        self.workspace_path = cwd.to_string_lossy().into_owned();
+        self.branch = read_branch(&cwd).unwrap_or_default();
     }
 
     /// 질문을 확정하고 참여자들을 PTY 에 띄운다.
@@ -254,11 +318,21 @@ impl App {
             vert[0],
         );
 
+        // 왼쪽 사이드바 + 오른쪽 패널들
+        let main = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(crate::sidebar::WIDTH),
+                Constraint::Min(20),
+            ])
+            .split(vert[1]);
+        crate::sidebar::draw(f, main[0], self);
+
         let n = self.panes.len().max(1);
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(vec![Constraint::Ratio(1, n as u32); n])
-            .split(vert[1]);
+            .split(main[1]);
 
         let focus = self.focus;
         for (i, p) in self.panes.iter().enumerate() {
@@ -297,10 +371,30 @@ impl App {
     }
 }
 
+/// .git/HEAD 에서 현재 브랜치 이름을 읽는다.
+fn read_branch(dir: &std::path::Path) -> Option<String> {
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        let head = d.join(".git").join("HEAD");
+        if head.is_file() {
+            let text = std::fs::read_to_string(head).ok()?;
+            let t = text.trim();
+            return Some(match t.strip_prefix("ref: refs/heads/") {
+                Some(name) => name.to_string(),
+                // 분리된 HEAD 면 커밋 해시 앞부분만 보여준다.
+                None => format!("({})", &t[..t.len().min(7)]),
+            });
+        }
+        cur = d.parent();
+    }
+    None
+}
+
 /// 패널 하나에 줄 PTY 크기. 테두리와 상하단 줄을 뺀 값이다.
 fn pane_size(area: Rect, n: usize) -> (u16, u16) {
     let n = n.max(1) as u16;
-    let w = (area.width / n).saturating_sub(2).max(20);
+    let usable = area.width.saturating_sub(crate::sidebar::WIDTH);
+    let w = (usable / n).saturating_sub(2).max(20);
     let h = area.height.saturating_sub(5).max(6);
     (h, w)
 }

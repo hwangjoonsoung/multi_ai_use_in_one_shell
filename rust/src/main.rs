@@ -11,6 +11,7 @@
 //!   multi_ai_cli --selftest    PTY+VT 파이프라인 자동 점검
 
 mod app;
+mod sidebar;
 mod pty;
 mod trust;
 mod vtscreen;
