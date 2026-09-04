@@ -676,6 +676,7 @@ dependencies = [
  "crossterm",
  "portable-pty",
  "ratatui",
+ "unicode-width",
  "vt100",
 ]
 

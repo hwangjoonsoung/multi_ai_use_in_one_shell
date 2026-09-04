@@ -35,6 +35,21 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--selftest") => return selftest(),
+        Some("--which") => {
+            // 각 에이전트를 어떻게 띄울지 보여준다. 기동 실패를 진단할 때 쓴다.
+            for (id, title) in AGENTS {
+                match pty::resolve_agent(id) {
+                    Some((exe, args)) => {
+                        println!("  {title:<16} {}", exe.display());
+                        if !args.is_empty() {
+                            println!("  {:<16} 선행 인자 {args:?}", "");
+                        }
+                    }
+                    None => println!("  {title:<16} 찾지 못함 — 이 참여자는 비활성"),
+                }
+            }
+            return Ok(());
+        }
         Some("--solo") => {
             let agent = args.get(1).cloned().unwrap_or_else(|| "claude".into());
             return with_terminal(|t| solo(t, &agent));
@@ -150,6 +165,34 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
             _ => {}
         }
         return Ok(());
+    }
+
+    // Alt+화살표 / Alt+숫자로 바로 이동한다. 프리픽스보다 빠르고,
+    // 에이전트 TUI 들이 Alt+방향키를 거의 쓰지 않아 충돌이 적다.
+    if k.modifiers.contains(KeyModifiers::ALT) {
+        let n = app.panes.len();
+        match k.code {
+            KeyCode::Left => {
+                if n > 0 {
+                    app.focus = (app.focus + n - 1) % n;
+                }
+                return Ok(());
+            }
+            KeyCode::Right => {
+                if n > 0 {
+                    app.focus = (app.focus + 1) % n;
+                }
+                return Ok(());
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                let i = c as usize - '1' as usize;
+                if i < n {
+                    app.focus = i;
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
     }
 
     if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char(']') {

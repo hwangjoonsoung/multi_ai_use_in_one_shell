@@ -30,7 +30,7 @@ pub struct PtySession {
 impl PtySession {
     /// 에이전트를 PTY 안에서 기동한다. 크기는 화면과 같아야 한다.
     pub fn spawn(agent: &str, rows: u16, cols: u16) -> Result<Self> {
-        let exe = resolve(agent)
+        let (exe, prefix) = resolve_agent(agent)
             .ok_or_else(|| anyhow!("실행 파일을 찾지 못했다: {agent}"))?;
 
         let pty = portable_pty::native_pty_system();
@@ -39,6 +39,9 @@ impl PtySession {
             .context("PTY 를 열지 못했다")?;
 
         let mut cmd = CommandBuilder::new(exe);
+        for a in &prefix {
+            cmd.arg(a);
+        }
         if let Ok(cwd) = std::env::current_dir() {
             cmd.cwd(cwd);
         }
@@ -207,6 +210,94 @@ impl Drop for PtySession {
     fn drop(&mut self) {
         self.kill();
     }
+}
+
+/// 에이전트를 어떻게 띄울지 해석한다.
+///
+/// 반환값은 (실행 파일, 선행 인자) 다. codex 처럼 실행 파일이 PATH 에
+/// `.exe` 로 없고 node 스크립트로 존재하는 경우가 있다.
+///
+/// **셸 래퍼(.cmd/.ps1)는 쓰지 않는다.** 셸이 인자를 재해석해 프롬프트가 깨진다
+/// (Java 판에서 실측 확인. SPEC §6.3).
+pub fn resolve_agent(agent: &str) -> Option<(PathBuf, Vec<String>)> {
+    // 사용자가 경로를 직접 준 경우
+    let direct = PathBuf::from(agent);
+    if direct.is_file() {
+        return Some((direct, vec![]));
+    }
+    match agent {
+        "codex" => resolve_codex(),
+        other => resolve(other).map(|p| (p, vec![])),
+    }
+}
+
+/// codex 는 PATH 에 codex.exe 가 없다. 셸 shim(codex/.cmd/.ps1)만 있다.
+///
+///   1순위  벤더 네이티브 codex.exe
+///   2순위  node.exe + codex.js  (shim 이 하는 일을 셸 없이 재현)
+///   실패   지원 불가로 보고한다
+fn resolve_codex() -> Option<(PathBuf, Vec<String>)> {
+    for root in npm_roots() {
+        let base = root.join("node_modules/@openai/codex/node_modules");
+        if base.is_dir() {
+            if let Some(exe) = find_file(&base, "codex.exe", 8, Some("vendor")) {
+                return Some((exe, vec![]));
+            }
+        }
+    }
+    let node = resolve("node")?;
+    for root in npm_roots() {
+        let js = root.join("node_modules/@openai/codex/bin/codex.js");
+        if js.is_file() {
+            return Some((node, vec![js.to_string_lossy().into_owned()]));
+        }
+    }
+    None
+}
+
+fn npm_roots() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        out.push(PathBuf::from(appdata).join("npm"));
+    }
+    // 셸 shim 이 있는 디렉터리도 후보다.
+    if let Some(p) = resolve("codex.cmd").and_then(|p| p.parent().map(PathBuf::from)) {
+        out.push(p);
+    }
+    out
+}
+
+/// 깊이 제한 재귀 탐색. 경로에 `must_contain` 이 들어간 것만 채택한다.
+fn find_file(dir: &std::path::Path, name: &str, depth: usize, must_contain: Option<&str>) -> Option<PathBuf> {
+    if depth == 0 {
+        return None;
+    }
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut dirs = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.is_dir() {
+            dirs.push(path);
+        } else if path.file_name().and_then(|s| s.to_str()) == Some(name) {
+            let ok = match must_contain {
+                Some(part) => path.to_string_lossy().replace(chr_backslash(), "/").contains(part),
+                None => true,
+            };
+            if ok {
+                return Some(path);
+            }
+        }
+    }
+    for d in dirs {
+        if let Some(hit) = find_file(&d, name, depth - 1, must_contain) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+fn chr_backslash() -> char {
+    92 as char
 }
 
 /// PATH 에서 실행 파일을 찾는다. Windows 는 확장자를 붙여 본다.

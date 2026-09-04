@@ -15,6 +15,7 @@ use ratatui::{
     Frame,
 };
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
 
 pub struct Pane {
     pub id: String,
@@ -93,7 +94,7 @@ impl App {
             }
         }
         self.status = if failed.is_empty() {
-            "Ctrl+] 프리픽스 · 1/2/3 포커스 · n 새 질문 · q 종료".into()
+            "Alt+←/→ 패널 이동 · Alt+1/2/3 직접 선택 · Ctrl+] 다음 n 새 질문, q 종료".into()
         } else {
             format!("기동 실패 — {}", failed.join(", "))
         };
@@ -192,7 +193,10 @@ impl App {
         f.render_widget(Paragraph::new(self.input.as_str()), inner);
 
         // 커서를 입력 끝에 둔다.
-        let len = self.input.chars().count() as u16;
+        //
+        // 문자 수가 아니라 **표시 폭**으로 세야 한다. 한글은 한 글자가 두 칸을
+        // 차지하므로 chars().count() 로 재면 커서가 글자 수만큼만 가서 어긋난다.
+        let len = UnicodeWidthStr::width(self.input.as_str()) as u16;
         let width = inner.width.max(1);
         let cx = inner.x + len % width;
         let cy = inner.y + len / width;
@@ -248,7 +252,7 @@ impl App {
         }
 
         let hint = if self.prefix {
-            "프리픽스 눌림 — 1/2/3 포커스 · n 새 질문 · q 종료".to_string()
+            "Ctrl+] 눌림 — n 새 질문 · q 종료 · 1/2/3 포커스".to_string()
         } else {
             self.status.clone()
         };

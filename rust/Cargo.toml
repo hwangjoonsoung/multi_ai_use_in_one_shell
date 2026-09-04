@@ -19,6 +19,9 @@ crossterm = "0.29"
 vt100 = "0.16"
 
 # 오류 처리
+# 한글은 두 칸을 차지한다. 커서 위치 계산에 필요하다.
+unicode-width = "0.2.1"
+
 anyhow = "1"
 
 [dev-dependencies]
