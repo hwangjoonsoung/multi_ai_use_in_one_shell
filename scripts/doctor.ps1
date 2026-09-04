@@ -1,4 +1,4 @@
-# 착수 전 환경 점검. SPEC §7.10 완료 기준의 /status 를 셸에서 미리 확인한다.
+﻿# 착수 전 환경 점검. SPEC §7.10 완료 기준의 /status 를 셸에서 미리 확인한다.
 # 사용법:  .\scripts\doctor.ps1
 
 $ErrorActionPreference = 'Continue'

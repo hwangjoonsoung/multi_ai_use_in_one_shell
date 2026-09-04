@@ -1,4 +1,4 @@
-# multi_ai_cli 실행.
+﻿# multi_ai_cli 실행.
 # 사용법:  .\scripts\run.ps1 [-Workspace <path>] [-Room <id>]
 #
 # 콘솔 코드페이지와 Java 출력 인코딩을 UTF-8 로 맞춘다.
@@ -39,4 +39,12 @@ $jvmArgs = @(
 )
 if ($Room) { $jvmArgs += @('--room', $Room) }
 
-& $java @jvmArgs
+# 파이프로 들어온 입력은 스크립트의 $input 에 담기고 자식 프로세스로 자동 전달되지
+# 않는다. 배치 실행(Get-Content cmds.txt | .\run.ps1)을 지원하려면 명시적으로 넘겨야
+# 한다. 다만 파이프가 없을 때 $input 을 넘기면 stdin 이 즉시 닫혀 대화형이 깨지므로
+# ExpectingInput 으로 갈라준다.
+if ($MyInvocation.ExpectingInput) {
+    $input | & $java @jvmArgs
+} else {
+    & $java @jvmArgs
+}

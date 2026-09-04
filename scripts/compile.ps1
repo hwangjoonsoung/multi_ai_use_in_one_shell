@@ -1,4 +1,4 @@
-# multi_ai_cli 컴파일. SPEC D12 — 외부 Java 라이브러리를 쓰지 않는다.
+﻿# multi_ai_cli 컴파일. SPEC D12 — 외부 Java 라이브러리를 쓰지 않는다.
 # 사용법:  .\scripts\compile.ps1
 
 $ErrorActionPreference = 'Stop'
@@ -18,7 +18,9 @@ $files = Get-ChildItem -Path $src -Filter *.java -Recurse | ForEach-Object { $_.
 Write-Host "컴파일 대상 $($files.Count) 개 파일"
 
 $listFile = Join-Path $env:TEMP "multiai-sources.txt"
-$files | Out-File -FilePath $listFile -Encoding utf8
+# BOM 없이 써야 한다. Windows PowerShell 5.1 의 Out-File -Encoding utf8 은 BOM 을
+# 붙이는데, javac 는 @목록파일의 BOM 을 첫 파일명의 일부로 읽어 "Invalid filename" 이 된다.
+[System.IO.File]::WriteAllLines($listFile, $files, (New-Object System.Text.UTF8Encoding $false))
 
 & $javac -encoding UTF-8 -d $out "@$listFile"
 if ($LASTEXITCODE -ne 0) {

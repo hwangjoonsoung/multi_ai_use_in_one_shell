@@ -66,7 +66,7 @@ public final class ChatApplication implements AutoCloseable {
             this.input = in;
             while (true) {
                 ui.prompt(room.name());
-                String line = in.readLine();
+                String line = clean(in.readLine());
                 if (line == null) break;
                 if (line.isBlank()) continue;
 
@@ -146,7 +146,7 @@ public final class ChatApplication implements AutoCloseable {
         try {
             while (!f.isDone()) {
                 if (input != null && input.ready()) {
-                    String line = input.readLine();
+                    String line = clean(input.readLine());
                     if (line == null) break;
                     if (line.strip().startsWith("/cancel")) {
                         List<String> a = new ArrayList<>(
@@ -556,6 +556,20 @@ public final class ChatApplication implements AutoCloseable {
     }
 
     // ---------- 헬퍼 ----------
+
+    /**
+     * 읽은 입력 줄을 정리한다.
+     *
+     * 스트림 선두의 BOM(U+FEFF)을 걷어낸다 — PowerShell 이 네이티브 프로세스로
+     * 파이프할 때 UTF-8 BOM 을 붙이는 경우가 있어, 그대로 두면 첫 줄의 "/status" 가
+     * "﻿/status" 가 되어 슬래시 명령으로 인식되지 않는다 (실측).
+     */
+    private static String clean(String line) {
+        if (line == null) return null;
+        int i = 0;
+        while (i < line.length() && line.charAt(i) == '﻿') i++;
+        return i == 0 ? line : line.substring(i);
+    }
 
     private static String pad(String s, int n) {
         return s.length() >= n ? s + " " : s + " ".repeat(n - s.length());

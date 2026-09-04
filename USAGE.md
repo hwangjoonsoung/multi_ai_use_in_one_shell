@@ -382,6 +382,12 @@ The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account
 
 `run.ps1` / `run.sh` 를 쓰면 콘솔 인코딩이 자동으로 맞춰진다. `java` 를 직접 실행하면 깨질 수 있다.
 
+### 스크립트를 고쳤더니 파서 오류가 난다
+
+`.ps1` 파일은 **UTF-8 BOM 을 유지해야 한다.** Windows PowerShell 5.1 은 BOM 이 없으면 파일을 CP949 로 읽어 한글 주석이 깨지고 파서가 죽는다.
+
+편집기에서 "UTF-8 with BOM" 으로 저장하면 된다. VS Code 라면 하단 인코딩 표시를 눌러 `Save with Encoding` → `UTF-8 with BOM`.
+
 ### 요청이 거부된다
 
 ```
