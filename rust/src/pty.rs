@@ -187,6 +187,28 @@ impl PtySession {
     }
 }
 
+impl PtySession {
+    /// 자식을 종료한다. 종료 확인까지 짧게 기다린다.
+    ///
+    /// 이걸 안 하면 우리가 빠져나온 뒤에도 에이전트 프로세스가 남는다.
+    /// Java 판에서 /cancel 을 만들며 겪었던 것과 같은 부류의 문제다.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        for _ in 0..20 {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for PtySession {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
 /// PATH 에서 실행 파일을 찾는다. Windows 는 확장자를 붙여 본다.
 ///
 /// 셸 래퍼(.cmd/.ps1)는 쓰지 않는다 — 셸이 인자를 재해석해 프롬프트가 깨진다

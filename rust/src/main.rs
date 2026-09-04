@@ -11,7 +11,7 @@ mod vtscreen;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -76,6 +76,12 @@ fn run(term: &mut Term, session: &mut pty::PtySession) -> Result<()> {
         if event::poll(Duration::from_millis(16))? {
             match event::read()? {
                 Event::Key(k) => {
+                    // Windows 에서 crossterm 은 누를 때(Press)와 뗄 때(Release)를
+                    // 모두 보낸다. 그대로 넘기면 한 번 친 키가 두 번 입력된다.
+                    // Repeat 은 길게 눌렀을 때이므로 함께 통과시킨다.
+                    if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                        continue;
+                    }
                     // Ctrl+] 는 우리 탈출구. 자식에게 넘기지 않는다.
                     if k.modifiers.contains(KeyModifiers::CONTROL)
                         && k.code == KeyCode::Char(']')
