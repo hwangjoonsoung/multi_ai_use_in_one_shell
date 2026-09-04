@@ -1,15 +1,19 @@
-//! R1 — PTY 하나에 에이전트를 띄워 화면에 붙인다.
+//! multi_ai_cli — Claude / Codex / Gemini(agy) 를 한 화면에서 다루는 에이전트 멀티플렉서.
 //!
-//! 목적은 하나다: **터미널에서 그 에이전트를 직접 쓰는 것과 구분이 안 되는가.**
-//! 로고·상태바·`/` 자동완성·권한 프롬프트가 다 보이고 조작돼야 한다.
-//! 여기서 막히면 이후 계획이 의미가 없다 (REBUILD.md §7.1).
+//! R1  PTY 하나를 화면에 붙인다 (통과)
+//! R2  참여자마다 자기 칸. 포커스된 칸으로만 키가 간다  ← 현재
 //!
-//! 사용법:  multi_ai_cli [에이전트]        기본값 claude
+//! 사용법
+//!   multi_ai_cli               시작 화면에서 질문을 입력한다
+//!   multi_ai_cli --solo <에이전트>   한 에이전트만 전체 화면으로 (R1 확인용)
+//!   multi_ai_cli --selftest    PTY+VT 파이프라인 자동 점검
 
+mod app;
 mod pty;
 mod vtscreen;
 
 use anyhow::Result;
+use app::{App, Mode};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
@@ -18,78 +22,178 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{io, time::Duration};
 
+/// 기본 참여자. R3 에서 설치 탐색 결과로 대체한다.
+const AGENTS: &[(&str, &str)] = &[
+    ("claude", "Claude"),
+    ("codex", "Codex"),
+    ("agy", "Gemini via agy"),
+];
+
+type Term = Terminal<CrosstermBackend<io::Stdout>>;
+
 fn main() -> Result<()> {
-    let arg = std::env::args().nth(1).unwrap_or_else(|| "claude".to_string());
-    if arg == "--selftest" {
-        return selftest();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--selftest") => return selftest(),
+        Some("--solo") => {
+            let agent = args.get(1).cloned().unwrap_or_else(|| "claude".into());
+            return with_terminal(|t| solo(t, &agent));
+        }
+        _ => {}
     }
-    let agent = arg;
+    with_terminal(run)
+}
 
-    // 터미널 크기를 알아야 PTY 를 같은 크기로 연다. 크기가 어긋나면
-    // 에이전트가 자기 화면을 잘못 그린다.
-    let (cols, rows) = crossterm::terminal::size()?;
-    let mut session = pty::PtySession::spawn(&agent, rows, cols)?;
-
+/// 터미널을 raw·대체 화면으로 바꾸고 끝나면 반드시 되돌린다.
+fn with_terminal<F>(body: F) -> Result<()>
+where
+    F: FnOnce(&mut Term) -> Result<()>,
+{
     enable_raw_mode()?;
     let mut out = io::stdout();
     execute!(out, EnterAlternateScreen)?;
     let mut term = Terminal::new(CrosstermBackend::new(out))?;
 
-    let result = run(&mut term, &mut session);
+    let result = body(&mut term);
 
     disable_raw_mode()?;
     execute!(term.backend_mut(), LeaveAlternateScreen)?;
     term.show_cursor()?;
+    result
+}
 
-    match result {
-        Ok(()) => {
-            println!("종료: {agent} 세션이 끝났습니다.");
-            Ok(())
+// ---------- R2 본 흐름 ----------
+
+fn run(term: &mut Term) -> Result<()> {
+    let mut app = App::new(AGENTS);
+
+    loop {
+        app.tick();
+        term.draw(|f| app.draw(f))?;
+        if app.quit {
+            return Ok(());
         }
-        Err(e) => Err(e),
+        let area = term.size()?;
+        app.sync_sizes(ratatui::layout::Rect::new(0, 0, area.width, area.height));
+
+        if !event::poll(Duration::from_millis(16))? {
+            continue;
+        }
+        match event::read()? {
+            Event::Key(k) => {
+                // Windows 는 누를 때와 뗄 때를 모두 보낸다. 그대로 넘기면
+                // 한 번 친 키가 두 번 입력된다.
+                if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                    continue;
+                }
+                match app.mode {
+                    Mode::Idle => on_key_idle(&mut app, k, term)?,
+                    Mode::Panes => on_key_panes(&mut app, k)?,
+                }
+            }
+            Event::Resize(_, _) => {
+                let a = term.size()?;
+                app.sync_sizes(ratatui::layout::Rect::new(0, 0, a.width, a.height));
+            }
+            _ => {}
+        }
     }
 }
 
-type Term = Terminal<CrosstermBackend<io::Stdout>>;
+/// 시작 화면 — 여기서는 우리가 직접 줄 편집을 한다.
+fn on_key_idle(app: &mut App, k: KeyEvent, term: &mut Term) -> Result<()> {
+    match k.code {
+        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => app.quit = true,
+        KeyCode::Enter => {
+            let q = app.input.trim().to_string();
+            if !q.is_empty() {
+                let a = term.size()?;
+                app.start_round(&q, ratatui::layout::Rect::new(0, 0, a.width, a.height));
+                app.input.clear();
+            }
+        }
+        KeyCode::Backspace => {
+            app.input.pop();
+        }
+        KeyCode::Esc => app.input.clear(),
+        KeyCode::Char(c) => app.input.push(c),
+        _ => {}
+    }
+    Ok(())
+}
 
-fn run(term: &mut Term, session: &mut pty::PtySession) -> Result<()> {
+/// 패널 화면 — 키는 포커스된 자식에게 그대로 간다.
+///
+/// 우리 조작은 프리픽스(Ctrl+]) 뒤에 온다. 그러지 않으면 에이전트가 쓰는 키를
+/// 우리가 가로채게 되고, 그 순간 "직접 쓰는 것과 같다"는 전제가 깨진다.
+fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
+    if app.prefix {
+        app.prefix = false;
+        match k.code {
+            KeyCode::Char(c @ '1'..='9') => {
+                let i = c as usize - '1' as usize;
+                if i < app.panes.len() {
+                    app.focus = i;
+                }
+            }
+            KeyCode::Char('n') => {
+                app.mode = Mode::Idle;
+                app.input.clear();
+            }
+            KeyCode::Char('q') => app.quit = true,
+            // 프리픽스를 한 번 더 누르면 프리픽스 자체를 자식에게 보낸다.
+            KeyCode::Char(']') => {
+                if let Some(s) = app.focused() {
+                    let _ = s.write(&[0x1d]);
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char(']') {
+        app.prefix = true;
+        return Ok(());
+    }
+
+    if let Some(bytes) = encode_key(&k) {
+        if let Some(s) = app.focused() {
+            let _ = s.write(&bytes);
+        }
+    }
+    Ok(())
+}
+
+/// 한 에이전트만 전체 화면으로. R1 검증용으로 남겨둔다.
+fn solo(term: &mut Term, agent: &str) -> Result<()> {
+    let size = term.size()?;
+    let mut session = pty::PtySession::spawn(agent, size.height, size.width)?;
     loop {
-        // 자식이 뱉은 출력을 파서에 먹인다.
         session.pump();
-
         term.draw(|f| {
             let area = f.area();
             let screen = session.screen();
             f.render_widget(vtscreen::VtScreen::new(&screen), area);
-            // 자식이 커서를 보이게 두었으면 우리도 같은 자리에 놓는다.
             if !screen.hide_cursor() {
                 let (r, c) = screen.cursor_position();
                 f.set_cursor_position((area.x + c, area.y + r));
             }
         })?;
-
         if session.finished() {
             return Ok(());
         }
-
-        // 키를 자식에게 그대로 넘긴다. 여기서 권한 승인·/ 자동완성·esc 가 동작한다.
         if event::poll(Duration::from_millis(16))? {
             match event::read()? {
                 Event::Key(k) => {
-                    // Windows 에서 crossterm 은 누를 때(Press)와 뗄 때(Release)를
-                    // 모두 보낸다. 그대로 넘기면 한 번 친 키가 두 번 입력된다.
-                    // Repeat 은 길게 눌렀을 때이므로 함께 통과시킨다.
                     if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                         continue;
                     }
-                    // Ctrl+] 는 우리 탈출구. 자식에게 넘기지 않는다.
-                    if k.modifiers.contains(KeyModifiers::CONTROL)
-                        && k.code == KeyCode::Char(']')
-                    {
+                    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char(']') {
                         return Ok(());
                     }
-                    if let Some(bytes) = encode_key(&k) {
-                        session.write(&bytes)?;
+                    if let Some(b) = encode_key(&k) {
+                        session.write(&b)?;
                     }
                 }
                 Event::Resize(c, r) => session.resize(r, c)?,
@@ -104,7 +208,6 @@ fn encode_key(k: &KeyEvent) -> Option<Vec<u8>> {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let b: Vec<u8> = match k.code {
         KeyCode::Char(c) if ctrl => {
-            // Ctrl+A..Z → 0x01..0x1A
             let up = c.to_ascii_uppercase();
             if up.is_ascii_uppercase() {
                 vec![up as u8 - b'A' + 1]
@@ -133,18 +236,12 @@ fn encode_key(k: &KeyEvent) -> Option<Vec<u8>> {
     Some(b)
 }
 
-/// TTY 없이 PTY + VT 파이프라인을 검증한다.
-///
-/// R1 의 성패는 "PTY 로 띄운 자식의 출력이 화면 버퍼로 정확히 들어오는가" 다.
-/// 대화형 렌더는 사람이 봐야 알지만, 아래 세 가지는 자동으로 확인할 수 있다.
-///   1. Windows ConPTY 로 자식이 뜨는가
-///   2. 출력이 vt100 파서를 거쳐 셀 격자에 들어오는가
-///   3. 색·굵기 같은 속성과 한글 와이드 셀이 보존되는가
-fn selftest() -> Result<()> {
-    println!("== R1 셀프테스트 ==");
+// ---------- 셀프테스트 ----------
 
-    // 1) ANSI 색과 한글을 함께 내보내는 자식을 PTY 에 띄운다.
-    // 인자로 프로그램을 바꿔 시험할 수 있게 한다. 기본은 cmd 로 가장 단순하게.
+/// TTY 없이 PTY + VT 파이프라인을 검증한다.
+fn selftest() -> Result<()> {
+    println!("== PTY + VT 셀프테스트 ==");
+
     let argv: Vec<String> = std::env::args().skip(2).collect();
     let (prog, args): (String, Vec<String>) = if argv.is_empty() {
         (
@@ -163,7 +260,6 @@ fn selftest() -> Result<()> {
 
     let mut s = pty::PtySession::spawn_raw(&prog, &argrefs, 24, 80)?;
 
-    // 자식이 끝날 때까지 최대 20초 기다리며 출력을 먹인다.
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     while std::time::Instant::now() < deadline {
         s.pump();
@@ -189,25 +285,28 @@ fn selftest() -> Result<()> {
         println!("  [FAIL] 평문이 화면 버퍼에 없다");
         ok = false;
     }
-
-    // 2) 속성 확인 — 빨강 글자의 전경색이 인덱스 1 이어야 한다.
     let red = find_cell(&screen, '빨').map(|c| c.fgcolor());
-    println!("  '빨' 전경색: {:?}", red);
+    println!("  '빨' 전경색: {red:?}");
     if !matches!(red, Some(vt100::Color::Idx(1))) {
         println!("  [FAIL] 색 속성이 보존되지 않았다");
         ok = false;
     }
-
-    // 3) 와이드 셀 확인 — 한글은 두 칸을 차지해야 한다.
     let wide = find_cell(&screen, '빨').map(|c| c.is_wide());
-    println!("  '빨' 와이드 셀: {:?}", wide);
+    println!("  '빨' 와이드 셀: {wide:?}");
     if wide != Some(true) {
         println!("  [FAIL] 한글이 와이드로 처리되지 않았다");
         ok = false;
     }
 
     println!();
-    println!("{}", if ok { "  RESULT: PTY + VT 파이프라인 정상" } else { "  RESULT: 실패" });
+    println!(
+        "{}",
+        if ok {
+            "  RESULT: PTY + VT 파이프라인 정상"
+        } else {
+            "  RESULT: 실패"
+        }
+    );
     if ok {
         Ok(())
     } else {

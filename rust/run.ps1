@@ -6,7 +6,7 @@
 #   .\run.ps1              claude 를 PTY 로 띄운다
 #   .\run.ps1 codex        다른 에이전트
 #   .\run.ps1 -SelfTest    PTY+VT 파이프라인만 자동 점검
-param([string]$Agent = 'claude', [switch]$SelfTest)
+param([string]$Agent = '', [switch]$SelfTest, [switch]$Solo)
 
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
