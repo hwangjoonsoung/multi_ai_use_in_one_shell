@@ -382,3 +382,93 @@ R1 결과에 따라 이 문서를 갱신한다. 특히 §7.1 판정 결과는 �
 | [REVIEW_REPORT.md](REVIEW_REPORT.md) | 5라운드 교차검토 (유효) |
 | [USAGE.md](USAGE.md) | Java 판 사용법. R5 에서 재작성 |
 | herdr | https://github.com/herdrdev/herdr · Apache 2.0 · Rust |
+
+---
+
+## 10. R0·R1 진행 기록 (2026-09-04)
+
+### R0 — 툴체인: **완료**
+
+| 항목 | 결과 |
+|---|---|
+| `cargo` | **1.98.1** 설치됨 (`~/.cargo/bin`) |
+| 툴체인 | `stable-x86_64-pc-windows-msvc` |
+| MSVC 링커 | `BuildTools\...\MSVC\14.44.35207\bin\HostX64\x64\link.exe` |
+| Windows SDK | `10.0.26100.0` (ucrt·um 라이브러리 존재) |
+
+**막혔던 것**: Developer Command Prompt 가 아니면 `LIB`·`INCLUDE` 가 비어 링커가
+`LNK1181: 'dbghelp.lib' 를 열 수 없습니다` 로 실패한다. `DbgHelp.Lib` 는 SDK 에 있지만
+경로가 안 잡힌다.
+
+**해결**: `rust/build.ps1` 이 설치된 MSVC 툴셋과 SDK 버전을 자동 탐색해 `LIB`/`INCLUDE` 를
+세팅한다. 이후 `cargo build` 정상 동작 확인.
+
+### 크레이트 확정
+
+```toml
+portable-pty = "0.9"      # PTY (Windows ConPTY)
+ratatui      = "0.30"     # TUI
+crossterm    = "0.29"     # 백엔드·raw 모드·키 이벤트
+vt100        = "0.16"     # VT 에뮬레이션 ← §7.1 위험 요소의 답
+anyhow       = "1"
+```
+
+**버전 충돌 하나**: `ratatui 0.29` 는 `unicode-width` 를 `=0.2.0` 으로 고정하는데
+`vt100 0.16` 은 `^0.2.1` 을 요구한다. **herdr 와 같은 `ratatui 0.30` + `crossterm 0.29`
+로 맞추니 해소됐다.**
+
+### §7.1 VT 에뮬레이션 판정: **기성품으로 된다 (vt100 0.16)**
+
+직접 구현하지 않아도 된다. `vt100::Parser` 가 화면 버퍼·커서·색·와이드 셀을 모두
+제공하며, `src/vtscreen.rs` 에서 ratatui 버퍼로 옮기는 코드는 60줄이면 끝난다.
+
+> herdr 에 VT 크레이트가 없던 것은 직접 짰기 때문이지, 기성품이 없어서가 아니었다.
+
+### R1 — PTY 렌더: **미판정. 실제 터미널 확인 필요**
+
+작성 완료된 것:
+
+| 파일 | 내용 |
+|---|---|
+| `rust/src/pty.rs` | PTY 열기·자식 기동·비동기 읽기·resize·키 쓰기 |
+| `rust/src/vtscreen.rs` | vt100 화면 → ratatui 버퍼 (색·굵기·역상·와이드 셀) |
+| `rust/src/main.rs` | 렌더 루프, 키 인코딩, `--selftest` |
+| `rust/build.ps1` · `rust/run.ps1` | LIB 자동 설정, 실행 |
+
+**막힌 지점**: 자동 검증 환경(Bash·PowerShell `Start-Job`)에서 자식 출력이 전혀 오지 않고
+자식이 종료도 하지 않는다. PTY 기동 자체는 성공한다(`controlling_tty: true`, argv 정상).
+
+```
+자식: cmd ["/c", "echo 빨강 OK"]
+자식 종료: false
+화면 첫 줄: "                    (전부 공백)                    "
+```
+
+**원인 후보**
+
+1. **콘솔 부재** — ConPTY 는 콘솔이 붙어 있어야 한다. 이 세션의 Bash 와
+   `Start-Job` 은 둘 다 콘솔이 없다. **가장 유력하다.**
+2. **portable-pty 의 Windows 문제** — herdr 가 `portable-pty 0.9.0` 을
+   **벤더링해서 패치**한 것이 방증이다. 스톡 크레이트에 손볼 곳이 있다는 뜻.
+
+**판정 방법 — 사용자가 실제 터미널에서 실행**
+
+```powershell
+cd C:\Users\HJS\Desktop\multi_ai\rust
+.\run.ps1 -SelfTest      # PTY+VT 파이프라인만 자동 점검
+.\run.ps1                # claude 를 PTY 로 띄운다. Ctrl+] 로 탈출
+```
+
+- `-SelfTest` 가 `RESULT: PTY + VT 파이프라인 정상` 을 내면 원인 1 이 맞고 **R1 통과**다.
+- 실제 터미널에서도 화면이 비면 원인 2 다. 그때는 아래로 간다.
+
+**원인 2 일 때의 대응 순서**
+
+1. `portable-pty` 최신 버전 시도
+2. herdr 의 벤더 패치 내용 확인 (Apache 2.0 이라 참고 가능)
+3. `windows-sys` 로 `CreatePseudoConsole` 직접 호출
+
+### 다음
+
+R1 판정 결과를 이 절에 추가한 뒤 R2(패널 분할)로 넘어간다. **판정 전에는 R2 를
+시작하지 않는다** — 기반이 안 되면 위에 쌓는 것이 의미가 없다.
