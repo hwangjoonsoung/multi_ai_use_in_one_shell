@@ -8,6 +8,7 @@ import io.multiai.cli.process.*;
 import io.multiai.cli.provider.*;
 import io.multiai.cli.room.*;
 import io.multiai.cli.ui.ConsoleRenderer;
+import io.multiai.cli.ui.TuiRenderer;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
@@ -30,6 +31,8 @@ public final class ChatApplication implements AutoCloseable {
     private final List<AiProvider> providers;
     private final ProcessLauncher launcher;
     private final ConsoleRenderer ui;
+    /** 화면 분할 UI. null 이면 평문 모드로 떨어진다. */
+    private final TuiRenderer tui;
     private final CommandParser parser;
     private final ParallelRoundExecutor executor = new ParallelRoundExecutor();
     private final PromptPresetRepository presets;
@@ -43,6 +46,13 @@ public final class ChatApplication implements AutoCloseable {
 
     public ChatApplication(RoomRepository repo, List<AiProvider> providers,
                            ProcessLauncher launcher, ConsoleRenderer ui, ChatRoom room) {
+        this(repo, providers, launcher, ui, room, null);
+    }
+
+    public ChatApplication(RoomRepository repo, List<AiProvider> providers,
+                           ProcessLauncher launcher, ConsoleRenderer ui, ChatRoom room,
+                           TuiRenderer tui) {
+        this.tui = tui;
         this.repo = repo;
         this.providers = providers;
         this.launcher = launcher;
@@ -64,7 +74,14 @@ public final class ChatApplication implements AutoCloseable {
     }
 
     public void run() throws IOException {
-        banner();
+        if (tui != null) {
+            tui.setProviders(providers.stream().map(AiProvider::id).toList(),
+                    providers.stream().map(AiProvider::displayName).toList());
+            refreshSideInfo();
+            tui.draw();
+        } else {
+            banner();
+        }
         try (BufferedReader in = new BufferedReader(
                 new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
             this.input = in;
@@ -73,10 +90,10 @@ public final class ChatApplication implements AutoCloseable {
                 String line;
                 if (!pending.isEmpty()) {
                     line = pending.pollFirst();
-                    ui.prompt(room.name());
+                    if (tui != null) tui.prompt(); else ui.prompt(room.name());
                     ui.print(line);
                 } else {
-                    ui.prompt(room.name());
+                    if (tui != null) tui.prompt(); else ui.prompt(room.name());
                     line = clean(in.readLine());
                 }
                 if (line == null) break;
@@ -96,6 +113,7 @@ public final class ChatApplication implements AutoCloseable {
             }
         }
         repo.saveMeta(room);
+        if (tui != null) tui.restore();
         ui.notice("기록 저장: " + room.transcript());
     }
 
@@ -126,10 +144,22 @@ public final class ChatApplication implements AutoCloseable {
             ui.notice("쓰기 프로필로 1회 실행한다 — 대상 " + targets.get(0).displayName()
                     + ", 워크스페이스 " + room.workspace());
         }
-        ui.running(targets.stream().map(AiProvider::displayName).toList());
+        if (tui != null) {
+            tui.startRound(text, targets.stream().map(AiProvider::id).toList());
+            refreshSideInfo();
+            tui.draw();
+        } else {
+            ui.running(targets.stream().map(AiProvider::displayName).toList());
+        }
         List<ProviderResult> results = runWatchingForCancel(targets, prompt, runDir, write);
         lastResults = results;
-        ui.roundSummary(results);
+        if (tui != null) {
+            results.forEach(tui::update);
+            refreshSideInfo();
+            tui.draw();
+        } else {
+            ui.roundSummary(results);
+        }
 
         for (ProviderResult r : results) {
             room.add(r.providerId(), r.status().name(), r.elapsed().toMillis(),
@@ -156,7 +186,12 @@ public final class ChatApplication implements AutoCloseable {
         java.util.concurrent.CompletableFuture<List<ProviderResult>> f =
                 java.util.concurrent.CompletableFuture.supplyAsync(() ->
                         executor.run(targets, prompt, room.workspace(), write,
-                                runDir, repo.tempDir(), TIMEOUT, r -> {}));
+                                runDir, repo.tempDir(), TIMEOUT, r -> {
+                                    if (tui != null) {
+                                        tui.update(r);
+                                        tui.draw();
+                                    }
+                                }));
         try {
             while (!f.isDone()) {
                 if (input != null && input.ready()) {
@@ -185,6 +220,54 @@ public final class ChatApplication implements AutoCloseable {
         }
     }
 
+    /** 왼쪽 dir / session 칸 내용을 갱신한다. */
+    private void refreshSideInfo() {
+        if (tui == null) return;
+        tui.setWorkspace(room.workspace().toString());
+        tui.setSession(room.name(),
+                "라운드 " + room.round()
+                        + "\n메시지 " + room.messages().size()
+                        + "\n문맥 " + PromptContextBuilder.maxMessages() + "개");
+    }
+
+    /** /s <번호|이름> <줄> — 칸 안에서 스크롤한다. 단일 키 입력을 못 받아 줄 단위다. */
+    private void scroll(List<String> args) {
+        if (tui == null) {
+            ui.error("평문 모드에서는 스크롤이 없다. /v 로 전체를 본다.");
+            return;
+        }
+        if (args.size() < 2) {
+            ui.error("사용법: /s <번호|이름> <줄번호>   예) /s claude 40");
+            return;
+        }
+        var p = tui.pane(args.get(0));
+        if (p.isEmpty()) {
+            ui.error("그런 칸이 없다: " + args.get(0));
+            return;
+        }
+        try {
+            p.get().scroll = Math.max(0, Integer.parseInt(args.get(1)));
+        } catch (NumberFormatException e) {
+            ui.error("줄 번호가 숫자가 아니다.");
+            return;
+        }
+        tui.draw();
+    }
+
+    /** /n — 질문 전 화면으로 되돌린다. */
+    private void resetScreen() {
+        if (tui == null) {
+            ui.error("평문 모드에서는 쓰지 않는다.");
+            return;
+        }
+        tui.startRound("", List.of());
+        lastResults = List.of();
+        tui.setHint("");
+        // started 를 끄기 위해 새 라운드 상태를 비우고 다시 그린다.
+        tui.panes().forEach(x -> { x.body = ""; x.status = "대기"; x.elapsed = ""; });
+        tui.draw();
+    }
+
     /**
      * /v [번호|all] — 직전 라운드의 답변 구역을 펼쳐 본다.
      *
@@ -197,8 +280,16 @@ public final class ChatApplication implements AutoCloseable {
             return;
         }
         if (args.isEmpty()) {
-            ui.roundSummary(lastResults);
+            if (tui != null) tui.draw(); else ui.roundSummary(lastResults);
             return;
+        }
+        if (tui != null) {
+            var p = tui.pane(args.get(0).replaceFirst("^@", ""));
+            if (p.isPresent()) {
+                p.get().scroll = 0;
+                tui.drawSingle(p.get());
+                return;
+            }
         }
         String a = args.get(0).toLowerCase(Locale.ROOT);
         if (a.equals("all") || a.equals("a")) {
@@ -271,6 +362,8 @@ public final class ChatApplication implements AutoCloseable {
             case "preset" -> preset(s);
             case "converge" -> converge(s);
             case "v", "view" -> view(s.args());
+            case "s", "scroll" -> scroll(s.args());
+            case "n" -> resetScreen();
             case "context" -> context(s.args());
             case "help" -> banner();
             default -> ui.error("알 수 없는 명령: /" + s.name() + "  (/help 로 목록 확인)");

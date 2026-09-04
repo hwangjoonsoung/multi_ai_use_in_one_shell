@@ -31,7 +31,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# TUI 는 터미널 크기를 알아야 칸을 나눈다. JVM 이 직접 알 수 없으므로 여기서 넘긴다.
+cols="$(tput cols 2>/dev/null || echo 120)"
+rows="$(tput lines 2>/dev/null || echo 30)"
+
 exec "$java_bin" \
+    -Dterm.cols="$cols" \
+    -Dterm.rows="$rows" \
     -Dfile.encoding=UTF-8 \
     -Dsun.stdout.encoding=UTF-8 \
     -Dsun.stderr.encoding=UTF-8 \

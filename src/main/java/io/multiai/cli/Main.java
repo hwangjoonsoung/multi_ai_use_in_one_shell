@@ -74,7 +74,13 @@ public final class Main {
                 ? repo.open(opt.get("room"))
                 : repo.create(null, workspace);
 
-        try (ChatApplication app = new ChatApplication(repo, providers, launcher, ui, room)) {
+        // 화면 분할 UI. 터미널이 ANSI 를 못 다루면 config 로 끌 수 있다.
+        io.multiai.cli.ui.TuiRenderer tui =
+                "plain".equalsIgnoreCase(cfg.getProperty("ui.mode", "tui"))
+                        ? null : new io.multiai.cli.ui.TuiRenderer();
+
+        try (ChatApplication app =
+                     new ChatApplication(repo, providers, launcher, ui, room, tui)) {
             Runtime.getRuntime().addShutdownHook(new Thread(launcher::shutdown, "cleanup"));
             app.run();
         }

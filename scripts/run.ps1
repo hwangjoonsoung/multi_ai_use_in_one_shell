@@ -29,7 +29,14 @@ if ($env:JAVA_HOME) {
     if (Test-Path $candidate) { $java = $candidate }
 }
 
+# TUI 는 터미널 크기를 알아야 칸을 나눈다. JVM 은 직접 알 수 없으므로 여기서 넘긴다.
+$sz = $Host.UI.RawUI.WindowSize
+$cols = if ($sz -and $sz.Width -gt 0) { $sz.Width } else { 120 }
+$rows = if ($sz -and $sz.Height -gt 0) { $sz.Height } else { 30 }
+
 $jvmArgs = @(
+    "-Dterm.cols=$cols"
+    "-Dterm.rows=$rows"
     '-Dfile.encoding=UTF-8'
     '-Dsun.stdout.encoding=UTF-8'
     '-Dsun.stderr.encoding=UTF-8'
