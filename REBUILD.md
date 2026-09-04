@@ -1,0 +1,384 @@
+# REBUILD — Rust + PTY 재작성 계획
+
+> 작성일: 2026-09-04
+> 결정: **Java 헤드리스 구현을 폐기하고 Rust + PTY 로 다시 만든다.**
+> 이유: 에이전트의 실제 대화형 UI를 패널에 띄우고 실시간으로 개입하려면 PTY 가 필수인데, Java 표준으로는 불가능하다.
+
+---
+
+## 1. 왜 다시 만드는가
+
+### 1.1. 지금까지 만든 것의 한계
+
+Java 구현(38파일 4,268줄, Phase 1~4 완료)은 **헤드리스 오케스트레이터**다. `claude -p` 로 호출해 최종 텍스트를 받아 우리가 렌더한다. 이 구조로는 아래가 **원리적으로 불가능**하다.
+
+| 원하는 것 | 왜 안 되는가 |
+|---|---|
+| 에이전트 실제 UI 표시 | 헤드리스는 UI를 만들지 않는다. 텍스트만 나온다 |
+| 권한 프롬프트 응답 | 대화형 세션이 없으니 물어볼 상대가 없다 |
+| 응답 스트리밍 | 완료 후 한 번에 받는다 |
+| `/` 네이티브 자동완성 | 에이전트의 TUI 기능이다 |
+| 중간 개입 (esc 로 중단, 방향 수정) | 세션이 없다 |
+
+### 1.2. Java 로는 못 넘는 벽 세 가지
+
+1. **PTY** — Java 표준에 없다. Windows 는 `CreatePseudoConsole`(ConPTY) 호출이 필요하고 JNI/JNA 가 있어야 한다.
+2. **VT 에뮬레이션** — 에이전트가 뱉는 ANSI 를 파싱해 화면 버퍼를 유지해야 한다.
+3. **raw 모드 입력** — 키를 포커스된 패널로 넘겨야 하는데 Java 표준으로 불가능하다.
+
+`D12`(외부 라이브러리 금지)를 포기하고 `pty4j` 를 넣어도 2·3 이 남는다. **언어를 바꾸는 것이 맞다.**
+
+### 1.3. 왜 Rust 인가 (Go 아님)
+
+참고 대상인 **herdr 가 Rust 다.** 확인 결과:
+
+| 항목 | herdr |
+|---|---|
+| 언어 | Rust (`cargo build --release`, "one rust binary, no electron") |
+| PTY | `portable-pty` **0.9.0 — 벤더링해서 패치까지 함** |
+| TUI | `ratatui` 0.30 + `crossterm` 0.29 |
+| 비동기 | `tokio` |
+| IPC | `interprocess` 2.4.2 |
+| 문자폭 | `unicode-width` |
+| 라이선스 | Apache 2.0 · Windows 지원 |
+
+Windows PTY(ConPTY) 지원은 **Rust 생태계가 Go 보다 성숙하다.** `portable-pty` 는 wezterm 이 실사용 중인 크레이트다.
+
+---
+
+## 2. 무엇이 달라지는가
+
+```text
+[ 지금 — Java 헤드리스 ]
+
+  사용자 ──> multi_ai_cli ──> claude -p "프롬프트"  ──> 최종 텍스트
+                          └─> codex exec -         ──> 최종 텍스트
+                          └─> agy -p "프롬프트"    ──> 최종 텍스트
+                                                        └─> 우리가 렌더
+
+[ 앞으로 — Rust + PTY ]
+
+  사용자 ──키──> 포커스된 패널 ──> PTY ──> claude (대화형 그대로)
+                                              │
+                    화면 버퍼 <── VT 파서 <────┘
+                          └──> ratatui 로 패널에 합성
+```
+
+**핵심 전환**: 우리가 답을 렌더하는 게 아니라, **에이전트가 자기 터미널에 그린 것을 그대로 보여준다.**
+
+### 2.1. 그런데 헤드리스도 버리지 않는다
+
+`/converge` 교차검증은 **헤드리스가 맞다.** 스키마 강제·구조화 출력·자동 분류가 대화형에서는 안 나온다.
+
+**한 바이너리에 두 실행 모드를 둔다.**
+
+| 용도 | 실행 방식 | 근거 |
+|---|---|---|
+| 일반 대화, 패널 | **PTY** (`portable-pty`) | 실제 UI, 개입 가능 |
+| `/converge` | **헤드리스** (`std::process::Command`) | 스키마 강제 필요 |
+
+`std::process::Command` 는 Rust 표준이라 추가 비용이 없다. **`/converge` 로직은 그대로 이식된다** — 스키마·분류 규칙·2라운드 조건은 언어와 무관하다.
+
+---
+
+## 3. 아키텍처
+
+### 3.1. 모듈 구성
+
+```text
+multi_ai_cli/                     (Cargo 워크스페이스 루트)
+  Cargo.toml
+  src/
+    main.rs                       진입점, CLI 인자
+    app.rs                        앱 상태, 이벤트 루프
+    config.rs                     config.toml 로드
+
+    pty/
+      mod.rs                      PtySession 계약
+      spawn.rs                    portable-pty 로 자식 기동
+      reader.rs                   PTY 출력을 비동기로 읽어 파서에 공급
+
+    vt/
+      mod.rs                      화면 버퍼 (셀 격자, 커서, 속성)
+      parser.rs                   ANSI/VT 시퀀스 파싱
+      screen.rs                   ratatui 위젯으로 변환
+
+    ui/
+      layout.rs                   spaces·agents 사이드바 + 탭 + 패널 분할
+      pane.rs                     패널 하나 (VT 화면 또는 텍스트)
+      sidebar.rs                  에이전트 상태 목록
+      input.rs                    입력 라우팅, 포커스 관리
+
+    agent/
+      mod.rs                      Agent 계약 (id, 표시명, 기동 명령)
+      claude.rs / codex.rs / agy.rs
+      registry.rs                 설치 탐색 (기존 CommandResolver 이식)
+
+    converge/                     ← Java 에서 그대로 이식
+      schema.rs                   ReviewSchema
+      review.rs                   StructuredReview 파싱
+      engine.rs                   합의/이견/단독지적/미해결 분류
+      report.rs                   REPORT.md 생성
+      session.rs                  1R → 분류 → 조건부 2R
+
+    room/
+      transcript.rs               길이 기반 프레이밍 (Java 규격 그대로)
+      repository.rs               방 저장·재개
+```
+
+### 3.2. 실행 흐름
+
+```text
+1. 시작
+   - config.toml 로드, 에이전트 설치 탐색
+   - 시작 화면 (질문 입력 대기)
+
+2. 질문 입력
+   - 대상 에이전트마다 PTY 열고 대화형으로 기동
+   - 각 PTY 에 프롬프트를 키 입력으로 주입
+
+3. 실행 중
+   - PTY 출력 → VT 파서 → 화면 버퍼 갱신
+   - 이벤트 루프가 주기적으로 패널 재렌더
+   - 사용자 키 입력 → 포커스된 패널의 PTY 로 전달
+     (권한 승인, esc 중단, / 자동완성 전부 여기서 됨)
+
+4. /converge
+   - PTY 를 쓰지 않고 헤드리스로 별도 spawn
+   - 스키마 강제 → JSON 파싱 → 분류 → REPORT.md
+```
+
+### 3.3. 화면 구성 (herdr 참고)
+
+```text
+┌ spaces ─────┬─ [탭] claude · codex · agy ──────────────────────┐
+│ ● herdr     │┌ claude ────┐┌ codex ─────┐┌ agy ──────────────┐│
+│   master    ││            ││            ││                   ││
+│ ● web-dash  ││  에이전트  ││  에이전트  ││   에이전트        ││
+│   feat/...  ││  실제 TUI  ││  실제 TUI  ││   실제 TUI        ││
+├ agents ─────┤│  그대로    ││  그대로    ││   그대로          ││
+│ ○ claude    ││            ││            ││                   ││
+│   working   ││            ││            ││                   ││
+│ ● codex     │└────────────┘└────────────┘└───────────────────┘│
+│   blocked   │ ~/proj > master * ↑1 > ctx ── 3% 31k/1M          │
+└─────────────┴──────────────────────────────────────────────────┘
+```
+
+- **왼쪽 위 spaces** — 작업 디렉터리/브랜치 묶음
+- **왼쪽 아래 agents** — 에이전트별 상태 (working / idle / blocked / done)
+- **가운데** — 에이전트마다 패널 하나. 그 안이 **에이전트의 실제 화면**
+
+---
+
+## 4. 기술 스택
+
+| 크레이트 | 용도 | 비고 |
+|---|---|---|
+| `portable-pty` | PTY 생성·크기 조절 | Windows ConPTY 지원. herdr 는 패치해서 씀 |
+| `ratatui` | TUI 레이아웃·렌더 | 패널·사이드바·탭 |
+| `crossterm` | 터미널 백엔드, raw 모드, 키 이벤트 | ratatui 백엔드 |
+| `tokio` | 비동기 런타임 | PTY 읽기, 타이머, 프로세스 |
+| `unicode-width` | 한글 2칸 폭 계산 | Java 에서 직접 짰던 것 |
+| `serde` + `serde_json` | 구조화 출력 파싱 | Java 에서 자작한 JSON 파서 대체 |
+| `toml` | 설정 파일 | `.properties` 대체 |
+| `anyhow` / `thiserror` | 오류 처리 | |
+| **VT 에뮬레이션** | **미정 — §7.1 참조** | 최대 위험 요소 |
+
+### 4.1. Java 대비 사라지는 제약
+
+| Java 제약 | Rust 에서는 |
+|---|---|
+| `D12` 외부 라이브러리 금지 → JSON 파서 자작 | `serde_json` 사용. Cargo 가 의존성을 다룬다 |
+| Windows 명령행 32,767자 한계 | **사라진다.** PTY 는 stdin 으로 주입한다 |
+| agy 가 stdin 을 못 받음 | **사라진다.** 대화형이라 키 입력으로 넣는다 |
+| 문맥 상한 16,000자 | 헤드리스(`/converge`)에만 남는다 |
+| raw 입력 불가 → `/s` 로 스크롤 | 방향키·PgUp 정상 동작 |
+
+---
+
+## 5. 이월 / 폐기
+
+### 5.1. 그대로 쓰는 것
+
+| 자산 | 상태 |
+|---|---|
+| `INTENT.md` | **그대로.** 목적·동기·금지사항은 언어 무관 |
+| `SPEC.md` §0~§5 | 그대로 (요구사항, 환경 실측, UX 규약) |
+| `SPEC.md` §7.5-1 수렴자 계약 | 그대로 |
+| `REVIEW_REPORT.md` | 그대로 (5라운드 교차검토 결과) |
+| `prompts/` | 그대로 |
+| **§7.6 transcript 프레이밍 규격** | 그대로. 길이 기반 프레이밍은 언어와 무관 |
+| **converge 분류 규칙** | 그대로 이식 |
+
+### 5.2. 실측으로 확정했던 사실들
+
+전부 유효하다. Rust 로 바꿔도 CLI 동작은 안 바뀐다.
+
+- codex 스키마는 모든 object 에 `additionalProperties: false` 필요
+- claude `--json-schema` 는 경로가 아니라 문자열만 받음
+- agy 는 `--json-schema <경로>` + `--output-format json` 정상
+- agy 기본 모델 `gemini-3.1-pro-high` (`D13`)
+- codex 네이티브 실행 파일 경로 (`node_modules/@openai/codex-win32-x64/vendor/.../codex.exe`)
+- 셸 래퍼(`.cmd`/`.ps1`) 경유 금지 — 셸 메타문자 재해석
+
+### 5.3. 개정이 필요한 것
+
+| 문서 | 무엇을 |
+|---|---|
+| `SPEC.md` §6.3 | 프로세스 실행 규칙을 PTY 기준으로 다시 쓴다. `ProcessBuilder` 전제가 사라진다 |
+| `SPEC.md` §7.2 | 호출 프로필을 대화형/헤드리스 두 벌로 나눈다 |
+| `SPEC.md` §7.1 | 프로젝트 구조를 Rust 모듈로 교체 |
+| `SPEC.md` `D12` | 폐기. Cargo 로 의존성을 관리한다 |
+| `SPEC.md` `D15` | 헤드리스 경로에만 적용으로 축소 |
+| `USAGE.md` | 전면 재작성 (빌드·실행·조작이 전부 바뀜) |
+
+### 5.4. 폐기하는 것
+
+**Java 소스 38파일.** 다만 **바로 지우지 않는다.**
+
+- Rust 가 동등 기능에 도달할 때까지 `legacy-java/` 로 옮겨 참조용으로 남긴다
+- 특히 `converge/` 와 `TranscriptCodec` 은 이식 시 원본 대조가 필요하다
+- 도달 후 태그를 남기고 제거한다 (`git tag java-final`)
+
+---
+
+## 6. 단계 계획
+
+각 단계 끝에 **동작하는 바이너리**가 나와야 한다. Java 때처럼 실행해 보지 않고 쌓지 않는다.
+
+### R0 — 선행 조건 (사용자 작업)
+
+Rust 툴체인과 링커가 없다. 둘 중 하나를 설치한다.
+
+```powershell
+# (권장) 가볍고 관리자 권한 불필요
+scoop install rustup mingw
+rustup default stable-x86_64-pc-windows-gnu
+
+# (대안) Rust 공식 기본값. 2~3GB, 관리자 권한 필요할 수 있음
+winget install --id Rustlang.Rustup -e
+winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet"
+```
+
+확인: `cargo --version` 이 나오면 된다.
+
+### R1 — PTY 한 개를 띄워 화면에 붙인다
+
+**이 단계가 전체의 성패를 가른다.** 여기서 막히면 나머지는 의미가 없다.
+
+- `portable-pty` 로 `claude` 를 PTY 에 띄운다
+- 출력을 VT 파서에 넣어 화면 버퍼를 만든다
+- `ratatui` 로 전체 화면에 그린다
+- 키 입력을 PTY 로 넘긴다
+
+**완료 기준**: 터미널에서 `claude` 를 직접 쓰는 것과 **구분이 안 될 것.** 로고·상태바·`/` 자동완성·권한 프롬프트가 다 보이고 조작돼야 한다.
+
+### R2 — 패널 분할과 포커스
+
+- 에이전트 셋을 각각 PTY 에 띄우고 나란히 배치
+- 패널마다 크기에 맞춰 PTY resize
+- 탭/포커스 전환, 포커스된 패널로만 키 전달
+- 시작 화면(질문 입력) → 패널 화면 전환
+
+**완료 기준**: 셋을 동시에 띄우고 하나를 골라 조작. 나머지는 계속 돌아간다.
+
+### R3 — 사이드바와 상태
+
+- spaces (작업 디렉터리·브랜치)
+- agents (working / idle / blocked / done)
+- 상태 판정 근거 정의 — 출력 변화, 프로세스 상태
+
+### R4 — 헤드리스 경로와 `/converge` 이식
+
+- `std::process::Command` 로 헤드리스 spawn
+- 스키마 강제 → `serde_json` 파싱
+- 분류 엔진·2라운드·`REPORT.md` 이식
+- transcript 프레이밍 이식
+
+### R5 — 방 저장·재개, 설정, macOS
+
+- `~/.multi-ai-cli/` 구조 유지
+- `config.toml`
+- macOS 확인 (Rust 는 크로스플랫폼이라 Java 때보다 부담이 적다)
+
+---
+
+## 7. 위험
+
+### 7.1. VT 에뮬레이션 — **최대 위험**
+
+**herdr 의 `Cargo.toml` 에 VT 에뮬레이션 크레이트가 없다.** `portable-pty` + `ratatui` + `crossterm` 뿐이다. 즉 **직접 구현했다는 뜻이다.**
+
+에이전트 TUI 를 패널에 정확히 그리려면 아래를 다뤄야 한다.
+
+- CSI/OSC/SGR 시퀀스 파싱
+- 셀 격자 + 속성(색·굵기·역상)
+- 커서 이동·저장·복원
+- 스크롤 영역, 화면 지우기
+- 대체 화면 버퍼 (에이전트 TUI 가 쓴다)
+- 와이드 문자(한글) 셀 점유
+
+**대응 순서**
+
+1. **먼저 기성 크레이트를 시도한다** — `vt100`, `avt`, `wezterm-term` 후보. R1 에서 실제로 붙여보고 판정한다.
+2. 기성품이 부족하면 **필요한 부분만 직접 구현**한다. 전체 VT 스펙이 아니라 대상 에이전트 셋이 실제로 쓰는 시퀀스만.
+3. **R1 에서 판정한다.** 여기서 안 되면 계획을 다시 짠다.
+
+> 이건 조사로 결론 낼 문제가 아니라 **붙여봐야 아는 문제**다. R1 을 짧게 끊어 빨리 확인한다.
+
+### 7.2. Windows ConPTY
+
+- `portable-pty` 가 지원하지만 GNU 툴체인에서의 동작을 R0 직후 확인해야 한다
+- 안 되면 MSVC 툴체인으로 전환
+
+### 7.3. 리소스
+
+- PTY 셋 + VT 파싱 + 주기적 렌더는 헤드리스보다 무겁다
+- 렌더 주기와 파싱 배치를 조절할 여지를 처음부터 둔다
+
+### 7.4. Rust 학습 비용
+
+- 소유권·비동기가 처음이면 R1 이 오래 걸릴 수 있다
+- 단계를 짧게 끊고 매번 돌려보는 것으로 상쇄한다
+
+---
+
+## 8. 미결정 사항
+
+착수 전에 정하지 않아도 되지만, 해당 단계 전에는 정해야 한다.
+
+| # | 안건 | 언제까지 |
+|:---:|---|---|
+| **P1** | VT 에뮬레이션 — 기성 크레이트 vs 자작 | R1 중 |
+| **P2** | 툴체인 — GNU vs MSVC | R0 |
+| **P3** | 프롬프트 주입 방식 — PTY 에 키 입력으로 넣을지, 에이전트 기동 인자로 넣을지 | R1 |
+| **P4** | 에이전트 상태(working/blocked) 판정 근거 | R3 |
+| **P5** | Java 코드 제거 시점 | R4 이후 |
+| **P6** | `/converge` 를 PTY 패널에서도 트리거할지, 별도 화면으로 뺄지 | R4 |
+
+---
+
+## 9. 다음에 할 일
+
+1. **R0 — 툴체인 설치** (사용자 작업, 또는 지시 시 대행)
+   ```powershell
+   scoop install rustup mingw
+   rustup default stable-x86_64-pc-windows-gnu
+   cargo --version
+   ```
+2. **Cargo 프로젝트 골격 생성** — 의존성 확정, 빈 모듈
+3. **R1 착수** — PTY 하나에 `claude` 를 띄워 화면에 붙인다. **VT 에뮬레이션 판정이 여기서 난다.**
+
+R1 결과에 따라 이 문서를 갱신한다. 특히 §7.1 판정 결과는 이후 전부에 영향을 준다.
+
+---
+
+## 참고
+
+| 문서 | 내용 |
+|---|---|
+| [INTENT.md](INTENT.md) | 목적·동기·금지사항 (유효) |
+| [SPEC.md](SPEC.md) | 기존 스펙. §6.3·§7.1·§7.2 는 개정 대상 |
+| [REVIEW_REPORT.md](REVIEW_REPORT.md) | 5라운드 교차검토 (유효) |
+| [USAGE.md](USAGE.md) | Java 판 사용법. R5 에서 재작성 |
+| herdr | https://github.com/herdrdev/herdr · Apache 2.0 · Rust |
