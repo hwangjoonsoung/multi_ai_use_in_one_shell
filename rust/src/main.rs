@@ -6,10 +6,13 @@
 //! 사용법
 //!   multi_ai_cli               시작 화면에서 질문을 입력한다
 //!   multi_ai_cli --solo <에이전트>   한 에이전트만 전체 화면으로 (R1 확인용)
+//!   multi_ai_cli --which       각 에이전트를 어떻게 띄우는지 확인
+//!   multi_ai_cli --trust       현재 디렉터리를 각 에이전트에 신뢰 등록
 //!   multi_ai_cli --selftest    PTY+VT 파이프라인 자동 점검
 
 mod app;
 mod pty;
+mod trust;
 mod vtscreen;
 
 use anyhow::Result;
@@ -35,6 +38,17 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--selftest") => return selftest(),
+        Some("--trust") => {
+            // 보안 결정이라 자동으로 하지 않는다. 이 명령을 직접 실행할 때만 기록한다.
+            let ws = std::env::current_dir()?;
+            println!("워크스페이스를 신뢰 목록에 등록한다: {}", ws.display());
+            println!("(대화상자에서 '예' 를 누르는 것과 같은 일이다)");
+            println!();
+            for r in trust::trust_workspace(&ws) {
+                println!("  {:<8} {}", r.agent, r.outcome);
+            }
+            return Ok(());
+        }
         Some("--which") => {
             // 각 에이전트를 어떻게 띄울지 보여준다. 기동 실패를 진단할 때 쓴다.
             for (id, title) in AGENTS {
