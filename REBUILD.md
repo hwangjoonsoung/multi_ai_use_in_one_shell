@@ -631,3 +631,77 @@ R4 는 헤드리스 경로와 `/converge` 이식이다. PTY 와 무관한 별도
 - 스키마 강제 → `serde_json` 파싱 (Java 판 자작 파서 불필요)
 - 분류 엔진·2라운드·`REPORT.md` 이식
 - transcript 길이 기반 프레이밍 이식
+
+## 10.5. R4 — 헤드리스와 `/converge`: **완료**
+
+PTY 와 무관한 **별도 실행 경로**로 구현했다. 대화형에서는 스키마 강제·구조화
+출력이 안 나오므로 한 바이너리에 두 모드를 둔다.
+
+| 모듈 | 내용 |
+|---|---|
+| `converge/schema.rs` | 공통 스키마와 1·2라운드 프롬프트 |
+| `converge/review.rs` | 응답 파싱. 텍스트에서 JSON 객체를 찾아낸다 |
+| `converge/engine.rs` | 합의·이견·단독지적 분류, 2라운드 조건 |
+| `converge/report.rs` | REPORT.md |
+| `converge/headless.rs` | 공급자별 호출 프로필 (`std::process::Command`) |
+| `converge/mod.rs` | 1R → 분류 → 조건부 2R → 보고서 |
+
+**Java 판에서 실측으로 확정한 사실을 그대로 옮겼다.**
+
+| 공급자 | 프로필 |
+|---|---|
+| claude | 프롬프트 stdin, `--output-format text`. `--json-schema` 는 안 쓴다(문자열만 받고 인자 전달이 깨지기 쉽다). 프롬프트에 스키마를 싣는다 |
+| codex | `exec -` 로 stdin, `-o <파일>`, `--output-schema <파일>` |
+| agy | stdin 불가 → 인자. `--json-schema <경로>` + `--output-format json` |
+
+**실측 검증** (`--converge "16000자 문맥 상한이 적절한가?"`)
+
+```
+1라운드 — 3명 독립 검토
+  [Claude] CONCERNS · 지적 3건
+  [Codex]  CONCERNS · 지적 3건
+  [agy]    CONCERNS · 지적 2건
+2라운드 — critical·major 단독 지적이 있다   ← 자동 발동
+보고서 생성 · 미해결 9건을 사용자 결정으로 올림
+```
+
+### 진단 장치
+
+파싱 실패를 눈으로 볼 수 없으면 원인을 좁힐 수 없다. **공급자 원시 출력을 항상
+남긴다** — `runs/<round>/converge/<id>.r1.raw.txt`. 실패 시 그 경로를 함께 보고한다.
+
+실제로 한 번 Claude 파싱이 실패했는데, 원문 덤프로 재현·확인한 결과 일시적
+문제였고 재실행에서 정상이었다.
+
+## 10.6. R5 — 저장·설정·macOS: **완료**
+
+| 항목 | 내용 |
+|---|---|
+| 저장 구조 | `~/.multi-ai-cli/{config.toml, temp/, rooms/<id>/}` — Java 판과 동일 |
+| transcript | **길이 기반 프레이밍** 이식. LF 고정, 이스케이프 없음 |
+| 재동기화 | 단조 증가 + `next_id` 상한. 복구분은 `[복원 의심]` 으로 표시 |
+| 설정 | `config.toml`. 읽는 키가 몇 개뿐이라 toml 크레이트를 쓰지 않는다 |
+| 방 조회 | `--rooms` 목록, `--show <ID>` 기록 |
+| macOS | 확장자 없는 PATH 탐색, Homebrew·`~/.local/bin` 보조 경로, codex 벤더 바이너리 |
+
+**`id == last_id + 1` 로 강화하지 않는다.** 손상으로 id 가 건너뛴 뒤 모든 후속
+메시지를 잃는다 — 5라운드 교차검토에서 실측으로 확정한 결론이다.
+
+### PTY 에서 "방 재개"의 의미
+
+Java 판과 다르다. PTY 세션은 되살릴 수 없다 — 에이전트 프로세스는 이미 끝났다.
+따라서 재개는 **기록 조회**를 뜻한다. 에이전트 대화 자체의 재개는 각 CLI 가
+자기 방식으로 제공한다(`claude --resume` 등). 우리가 흉내 내지 않는다.
+
+## 10.7. 전체 진행
+
+| | 내용 | 상태 |
+|:---:|---|:---:|
+| R0 | 툴체인 | 완료 |
+| R1 | PTY 한 개 렌더 | 완료 |
+| R2 | 패널 분할·포커스 | 완료 |
+| R3 | 사이드바·상태 | 완료 |
+| R4 | 헤드리스·`/converge` | 완료 |
+| R5 | 저장·설정·macOS | 완료 |
+
+macOS 는 **코드 경로만 마련했고 실기 검증은 못 했다.** Windows 에서만 실행해 봤다.

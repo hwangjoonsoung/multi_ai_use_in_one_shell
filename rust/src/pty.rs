@@ -227,8 +227,23 @@ pub fn resolve_agent(agent: &str) -> Option<(PathBuf, Vec<String>)> {
     }
     match agent {
         "codex" => resolve_codex(),
+        // agy 는 macOS 에서 ~/.local/bin 에 설치되는 경우가 많다 (SPEC §8.4 K6).
+        "agy" if !cfg!(windows) => {
+            let local = home_dir().join(".local/bin/agy");
+            if local.is_file() {
+                return Some((local, vec![]));
+            }
+            resolve("agy").map(|p| (p, vec![]))
+        }
         other => resolve(other).map(|p| (p, vec![])),
     }
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// codex 는 PATH 에 codex.exe 가 없다. 셸 shim(codex/.cmd/.ps1)만 있다.
@@ -237,10 +252,11 @@ pub fn resolve_agent(agent: &str) -> Option<(PathBuf, Vec<String>)> {
 ///   2순위  node.exe + codex.js  (shim 이 하는 일을 셸 없이 재현)
 ///   실패   지원 불가로 보고한다
 fn resolve_codex() -> Option<(PathBuf, Vec<String>)> {
+    let native = if cfg!(windows) { "codex.exe" } else { "codex" };
     for root in npm_roots() {
         let base = root.join("node_modules/@openai/codex/node_modules");
         if base.is_dir() {
-            if let Some(exe) = find_file(&base, "codex.exe", 8, Some("vendor")) {
+            if let Some(exe) = find_file(&base, native, 8, Some("vendor")) {
                 return Some((exe, vec![]));
             }
         }
@@ -259,6 +275,12 @@ fn npm_roots() -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(appdata) = std::env::var_os("APPDATA") {
         out.push(PathBuf::from(appdata).join("npm"));
+    }
+    if !cfg!(windows) {
+        // Homebrew(Intel/Apple Silicon)와 사용자 npm prefix
+        out.push(PathBuf::from("/opt/homebrew/lib"));
+        out.push(PathBuf::from("/usr/local/lib"));
+        out.push(home_dir().join(".npm-global/lib"));
     }
     // 셸 shim 이 있는 디렉터리도 후보다.
     if let Some(p) = resolve("codex.cmd").and_then(|p| p.parent().map(PathBuf::from)) {
@@ -311,7 +333,14 @@ fn resolve(name: &str) -> Option<PathBuf> {
     }
     let exts: &[&str] = if cfg!(windows) { &[".exe", ""] } else { &[""] };
     let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    if !cfg!(windows) {
+        // GUI 로 띄우면 PATH 가 빈약하다. 흔한 위치를 보조로 덧붙인다.
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push(home_dir().join(".local/bin"));
+    }
+    for dir in dirs {
         for ext in exts {
             let c = dir.join(format!("{name}{ext}"));
             if c.is_file() {

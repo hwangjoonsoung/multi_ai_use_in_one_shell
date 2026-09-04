@@ -6,11 +6,16 @@
 //! 사용법
 //!   multi_ai_cli               시작 화면에서 질문을 입력한다
 //!   multi_ai_cli --solo <에이전트>   한 에이전트만 전체 화면으로 (R1 확인용)
+//!   multi_ai_cli --converge [@수렴자] <안건>   구조화 교차검증 → REPORT.md
+//!   multi_ai_cli --rooms       저장된 방 목록
+//!   multi_ai_cli --show <ID>   방 기록 보기
 //!   multi_ai_cli --which       각 에이전트를 어떻게 띄우는지 확인
 //!   multi_ai_cli --trust       현재 디렉터리를 각 에이전트에 신뢰 등록
 //!   multi_ai_cli --selftest    PTY+VT 파이프라인 자동 점검
 
 mod app;
+mod converge;
+mod room;
 mod sidebar;
 mod pty;
 mod trust;
@@ -35,18 +40,69 @@ const AGENTS: &[(&str, &str)] = &[
 
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
+/// println! 대신 쓴다.
+///
+/// 출력을 `head` 같은 곳으로 파이프하면 상대가 먼저 닫아 쓰기가 실패하는데,
+/// println! 은 그때 패닉한다. 크래시처럼 보이지만 정상적인 상황이므로 조용히 넘긴다.
+macro_rules! outln {
+    () => { { use std::io::Write; let _ = writeln!(std::io::stdout()); } };
+    ($($arg:tt)*) => { {
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    } };
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--selftest") => return selftest(),
+        Some("--rooms") => {
+            let rooms = room::list();
+            if rooms.is_empty() {
+                outln!("저장된 방이 없다.");
+            }
+            for (id, dir) in rooms {
+                let n = room::read_transcript(&dir.join("transcript.md"), room::next_id_of(&dir)).len();
+                outln!("  {id:<16} 메시지 {n}건  {}", dir.display());
+            }
+            return Ok(());
+        }
+        Some("--show") => {
+            let Some(id) = args.get(1) else {
+                eprintln!("사용법: multi_ai_cli --show <방 ID>   (--rooms 로 목록 확인)");
+                return Ok(());
+            };
+            let dir = room::rooms_dir().join(id);
+            let msgs = room::read_transcript(&dir.join("transcript.md"), room::next_id_of(&dir));
+            if msgs.is_empty() {
+                outln!("기록이 없거나 방을 찾지 못했다: {id}");
+            }
+            for m in msgs {
+                // 복구분은 그렇다고 밝힌다. 정상 복원인 척하지 않는다.
+                let mark = if m.suspect { "  [복원 의심]" } else { "" };
+                outln!("── [{}] {}{}", m.id, m.sender, mark);
+                outln!("{}", m.body);
+                outln!("");
+            }
+            return Ok(());
+        }
+        Some("--converge") => {
+            let subject = args[1..].join(" ");
+            if subject.trim().is_empty() {
+                eprintln!("사용법: multi_ai_cli --converge <안건>");
+                eprintln!("        [@수렴자] 를 앞에 붙이면 그 참여자는 검토에서 빠진다");
+                return Ok(());
+            }
+            return run_converge(&subject);
+        }
         Some("--trust") => {
             // 보안 결정이라 자동으로 하지 않는다. 이 명령을 직접 실행할 때만 기록한다.
             let ws = std::env::current_dir()?;
-            println!("워크스페이스를 신뢰 목록에 등록한다: {}", ws.display());
-            println!("(대화상자에서 '예' 를 누르는 것과 같은 일이다)");
-            println!();
+            outln!("워크스페이스를 신뢰 목록에 등록한다: {}", ws.display());
+            outln!("(대화상자에서 '예' 를 누르는 것과 같은 일이다)");
+            outln!("");
             for r in trust::trust_workspace(&ws) {
-                println!("  {:<8} {}", r.agent, r.outcome);
+                outln!("  {:<8} {}", r.agent, r.outcome);
             }
             return Ok(());
         }
@@ -55,12 +111,12 @@ fn main() -> Result<()> {
             for (id, title) in AGENTS {
                 match pty::resolve_agent(id) {
                     Some((exe, args)) => {
-                        println!("  {title:<16} {}", exe.display());
+                        outln!("  {title:<16} {}", exe.display());
                         if !args.is_empty() {
-                            println!("  {:<16} 선행 인자 {args:?}", "");
+                            outln!("  {:<16} 선행 인자 {args:?}", "");
                         }
                     }
-                    None => println!("  {title:<16} 찾지 못함 — 이 참여자는 비활성"),
+                    None => outln!("  {title:<16} 찾지 못함 — 이 참여자는 비활성"),
                 }
             }
             return Ok(());
@@ -294,11 +350,110 @@ fn encode_key(k: &KeyEvent) -> Option<Vec<u8>> {
     Some(b)
 }
 
+// ---------- 구조화 수렴 (헤드리스) ----------
+
+/// `/converge` 의 CLI 진입점.
+///
+/// PTY 를 쓰지 않는다. 대화형에서는 스키마 강제가 안 되기 때문이다.
+/// 한 바이너리에 두 실행 모드를 두는 이유가 이것이다.
+fn run_converge(raw: &str) -> Result<()> {
+    let cfg = room::Config::load();
+    let ws = std::env::current_dir()?;
+
+    // 앞에 @이름 이 오면 그 참여자를 수렴자로 보고 검토에서 뺀다.
+    let (consolidator, subject) = match raw.strip_prefix('@') {
+        Some(rest) => match rest.split_once(char::is_whitespace) {
+            Some((who, s)) => (Some(who.to_lowercase()), s.trim().to_string()),
+            None => (None, raw.to_string()),
+        },
+        None => (None, raw.to_string()),
+    };
+
+    let reviewers: Vec<(String, String)> = AGENTS
+        .iter()
+        .filter(|(id, _)| consolidator.as_deref() != Some(*id))
+        .map(|(id, name)| (id.to_string(), name.to_string()))
+        .collect();
+
+    outln!("안건: {subject}");
+    outln!("검토자: {}", reviewers.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>().join(", "));
+    match &consolidator {
+        Some(c) => outln!("수렴자: {c} (검토에서 제외)"),
+        None => outln!("수렴자: 규칙 기반 (모델 호출 없음)"),
+    }
+    outln!("");
+
+    let mut r = room::Room::create(&ws)?;
+    let round = r.start_round();
+    let out_dir = r.run_dir(round)?.join("converge");
+
+    let session = converge::Session {
+        reviewers,
+        workspace: ws,
+        out_dir,
+        agy_model: Some(&cfg.agy_model),
+    };
+    let res = session.run(
+        &subject,
+        &converge::Progress {
+            stage: &|m| outln!("  · {m}"),
+            done: &|r| outln!("  [{}] {} · 지적 {}건", r.reviewer_name, r.verdict.label(), r.issues.len()),
+        },
+    )?;
+
+    if let Some(reason) = res.aborted {
+        eprintln!();
+        eprintln!("  ! {reason}");
+        return Ok(());
+    }
+
+    let last = res.round2.as_ref().or(res.round1.as_ref());
+    if let Some(o) = last {
+        outln!("");
+        outln!("== 판정 요약 ==");
+        for rv in &o.reviews {
+            outln!("  {:<18} {}", rv.reviewer_name, rv.verdict.label());
+        }
+        let mut failed = res.round1.as_ref().map(|x| x.failed.clone()).unwrap_or_default();
+        if let Some(x) = &res.round2 {
+            failed.extend(x.failed.clone());
+        }
+        failed.dedup();
+        if !failed.is_empty() {
+            outln!("  ! PARTIAL — 응답 없음: {}", failed.join(", "));
+        }
+        outln!("");
+        outln!(
+            "  합의 {} · 이견 {} · 단독 지적 {} · 미해결 {}",
+            o.count(converge::engine::Bucket::Agreed),
+            o.count(converge::engine::Bucket::Disputed),
+            o.count(converge::engine::Bucket::Solo),
+            o.open_questions.len()
+        );
+        if !o.open_questions.is_empty() {
+            outln!("");
+            outln!("== 사용자 결정 필요 ==");
+            for q in &o.open_questions {
+                outln!("  - {q}");
+            }
+        }
+    }
+    // 기록은 남기되 터미널에는 요약만 낸다. 전문은 보고서에 있다.
+    let _ = r.append("user", "OK", 0, &subject);
+    if let Some(rep) = &res.report {
+        let _ = r.append("consolidator", "OK", 0, &format!("보고서: {}", rep.display()));
+        outln!("");
+        outln!("  · 보고서: {}", rep.display());
+    }
+    outln!("  · 기록: {}", r.transcript().display());
+    Ok(())
+}
+
 // ---------- 셀프테스트 ----------
 
 /// TTY 없이 PTY + VT 파이프라인을 검증한다.
 fn selftest() -> Result<()> {
-    println!("== PTY + VT 셀프테스트 ==");
+    outln!("== PTY + VT 셀프테스트 ==");
 
     let argv: Vec<String> = std::env::args().skip(2).collect();
     let (prog, args): (String, Vec<String>) = if argv.is_empty() {
@@ -314,7 +469,7 @@ fn selftest() -> Result<()> {
         (argv[0].clone(), argv[1..].to_vec())
     };
     let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    println!("  자식: {prog} {argrefs:?}");
+    outln!("  자식: {prog} {argrefs:?}");
 
     let mut s = pty::PtySession::spawn_raw(&prog, &argrefs, 24, 80)?;
 
@@ -330,34 +485,34 @@ fn selftest() -> Result<()> {
 
     let screen = s.screen();
     let text = screen_text(&screen);
-    println!("  자식 종료: {} (코드 {:?})", s.finished(), s.exit_code);
-    println!("  수신 바이트: {}", s.rx_bytes);
-    println!("  화면 첫 줄: {:?}", text.lines().next().unwrap_or(""));
+    outln!("  자식 종료: {} (코드 {:?})", s.finished(), s.exit_code);
+    outln!("  수신 바이트: {}", s.rx_bytes);
+    outln!("  화면 첫 줄: {:?}", text.lines().next().unwrap_or(""));
 
     let mut ok = true;
     if !text.contains("빨강") {
-        println!("  [FAIL] 한글이 화면 버퍼에 없다");
+        outln!("  [FAIL] 한글이 화면 버퍼에 없다");
         ok = false;
     }
     if !text.contains("OK") {
-        println!("  [FAIL] 평문이 화면 버퍼에 없다");
+        outln!("  [FAIL] 평문이 화면 버퍼에 없다");
         ok = false;
     }
     let red = find_cell(&screen, '빨').map(|c| c.fgcolor());
-    println!("  '빨' 전경색: {red:?}");
+    outln!("  '빨' 전경색: {red:?}");
     if !matches!(red, Some(vt100::Color::Idx(1))) {
-        println!("  [FAIL] 색 속성이 보존되지 않았다");
+        outln!("  [FAIL] 색 속성이 보존되지 않았다");
         ok = false;
     }
     let wide = find_cell(&screen, '빨').map(|c| c.is_wide());
-    println!("  '빨' 와이드 셀: {wide:?}");
+    outln!("  '빨' 와이드 셀: {wide:?}");
     if wide != Some(true) {
-        println!("  [FAIL] 한글이 와이드로 처리되지 않았다");
+        outln!("  [FAIL] 한글이 와이드로 처리되지 않았다");
         ok = false;
     }
 
-    println!();
-    println!(
+    outln!("");
+    outln!(
         "{}",
         if ok {
             "  RESULT: PTY + VT 파이프라인 정상"
