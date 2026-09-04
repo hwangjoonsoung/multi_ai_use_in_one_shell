@@ -23,19 +23,56 @@ pub struct Pane {
     pub session: Option<PtySession>,
     /// 마지막으로 맞춰둔 크기. 달라졌을 때만 resize 한다.
     size: (u16, u16),
+    /// 아직 넣지 못한 프롬프트. 이 칸이 준비되면 넣는다.
+    pending: Option<String>,
+    /// 기동 시각. 최대 대기 시간을 재는 기준.
+    started: Option<Instant>,
+    /// 마지막으로 관측한 수신 바이트 수와 그 시각. 출력이 멎으면 준비된 것으로 본다.
+    seen: (usize, Instant),
 }
 
 impl Pane {
     fn new(id: &str, title: &str) -> Self {
-        Self { id: id.into(), title: title.into(), session: None, size: (0, 0) }
+        Self {
+            id: id.into(),
+            title: title.into(),
+            session: None,
+            size: (0, 0),
+            pending: None,
+            started: None,
+            seen: (0, Instant::now()),
+        }
     }
 
     fn status(&self) -> &'static str {
         match &self.session {
             None => "대기",
             Some(s) if s.finished() => "종료",
+            Some(_) if self.pending.is_some() => "기동 중",
             Some(_) => "실행 중",
         }
+    }
+
+    /// 프롬프트를 넣어도 되는 상태인가.
+    ///
+    /// 에이전트마다 기동 속도가 크게 다르다(agy 는 모델 조회 때문에 느리다).
+    /// 고정 지연으로는 빠른 쪽엔 낭비, 느린 쪽엔 입력이 삼켜진다. 그래서
+    /// **출력이 한 번 나온 뒤 잠잠해지면** 준비된 것으로 본다.
+    fn ready_to_inject(&mut self) -> bool {
+        let Some(s) = self.session.as_ref() else { return false };
+        let Some(started) = self.started else { return false };
+        let rx = s.rx_bytes;
+        if rx != self.seen.0 {
+            self.seen = (rx, Instant::now());
+            return false;
+        }
+        // 아무것도 못 받았으면 아직 뜨는 중이다.
+        if rx == 0 {
+            return started.elapsed() >= Duration::from_secs(20);
+        }
+        // 출력이 멎고 600ms 지났거나, 20초를 넘겼으면 넣는다.
+        self.seen.1.elapsed() >= Duration::from_millis(600)
+            || started.elapsed() >= Duration::from_secs(20)
     }
 }
 
@@ -55,8 +92,6 @@ pub struct App {
     /// 프리픽스를 누른 직후인가. 다음 키를 우리 명령으로 해석한다.
     pub prefix: bool,
     pub quit: bool,
-    /// 에이전트 TUI 가 뜨기 전에 키를 넣으면 삼켜진다. 잠깐 기다렸다 주입한다.
-    inject: Option<(String, Instant)>,
 }
 
 impl App {
@@ -70,7 +105,6 @@ impl App {
             status: String::new(),
             prefix: false,
             quit: false,
-            inject: None,
         }
     }
 
@@ -89,6 +123,9 @@ impl App {
                 Ok(s) => {
                     p.session = Some(s);
                     p.size = (h, w);
+                    p.pending = Some(question.to_string());
+                    p.started = Some(Instant::now());
+                    p.seen = (0, Instant::now());
                 }
                 Err(e) => failed.push(format!("{}: {}", p.title, e)),
             }
@@ -98,26 +135,23 @@ impl App {
         } else {
             format!("기동 실패 — {}", failed.join(", "))
         };
-        self.inject = Some((question.to_string(), Instant::now()));
     }
 
-    /// 살아 있는 세션의 출력을 먹이고, 대기 중인 주입을 처리한다.
+    /// 살아 있는 세션의 출력을 먹이고, 준비된 칸에 프롬프트를 넣는다.
     pub fn tick(&mut self) {
         for p in self.panes.iter_mut() {
             if let Some(s) = p.session.as_mut() {
                 s.pump();
             }
-        }
-        // 에이전트가 화면을 그리기 시작한 뒤에 넣어야 삼켜지지 않는다.
-        if let Some((text, at)) = self.inject.clone() {
-            if at.elapsed() >= Duration::from_millis(1500) {
-                for p in self.panes.iter_mut() {
-                    if let Some(s) = p.session.as_mut() {
-                        let _ = s.write(text.as_bytes());
-                        let _ = s.write(b"\r");
-                    }
+            if p.pending.is_some() && p.ready_to_inject() {
+                let text = p.pending.take().unwrap_or_default();
+                if let Some(s) = p.session.as_mut() {
+                    let _ = s.write(text.as_bytes());
+                    // 개행은 살짝 뒤에 보낸다. 붙여 보내면 입력창이 아직 다 안
+                    // 그려진 에이전트에서 첫 글자가 잘린다.
+                    std::thread::sleep(Duration::from_millis(120));
+                    let _ = s.write(&[13]);
                 }
-                self.inject = None;
             }
         }
     }
