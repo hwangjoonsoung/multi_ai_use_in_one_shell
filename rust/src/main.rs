@@ -14,6 +14,7 @@
 //!   multi_ai_cli --selftest    PTY+VT 파이프라인 자동 점검
 
 mod app;
+mod modal;
 mod model;
 mod subagents;
 mod converge;
@@ -227,6 +228,7 @@ fn run(term: &mut Term) -> Result<()> {
                     Mode::Panes => on_key_panes(&mut app, k)?,
                     Mode::Picker => on_key_picker(&mut app, k, term)?,
                     Mode::NewSpace => on_key_new_space(&mut app, k)?,
+                    Mode::Broadcast => on_key_broadcast(&mut app, k)?,
                 }
             }
             Event::Mouse(m) => on_mouse(&mut app, m),
@@ -247,15 +249,39 @@ fn on_key_idle(app: &mut App, k: KeyEvent, term: &mut Term) -> Result<()> {
             let q = app.input.trim().to_string();
             if !q.is_empty() {
                 let a = term.size()?;
+                app.status.clear();
                 app.start_round(&q, ratatui::layout::Rect::new(0, 0, a.width, a.height));
-                app.input.clear();
+                // 아무도 안 골랐으면 start_round 가 이유를 남기고 그대로 있는다.
+                if !matches!(app.mode, Mode::Idle) {
+                    app.input.clear();
+                }
             }
         }
+        // 입력창과 체크박스 사이를 오간다.
+        KeyCode::Tab => app.cycle_idle_focus(1),
+        KeyCode::BackTab => app.cycle_idle_focus(-1),
+        KeyCode::Right if app.idle_focus > 0 => app.cycle_idle_focus(1),
+        KeyCode::Left if app.idle_focus > 0 => app.cycle_idle_focus(-1),
+        KeyCode::Down => app.cycle_idle_focus(1),
+        KeyCode::Up => app.cycle_idle_focus(-1),
+        // Space 는 체크박스 위에서만 켜기/끄기다. 입력창에서는 띄어쓰기다.
+        KeyCode::Char(' ') if app.idle_focus > 0 => {
+            let i = app.idle_focus - 1;
+            app.toggle_agent(i);
+        }
         KeyCode::Backspace => {
+            app.idle_focus = 0;
             app.input.pop();
         }
-        KeyCode::Esc => app.input.clear(),
-        KeyCode::Char(c) => app.input.push(c),
+        KeyCode::Esc => {
+            app.idle_focus = 0;
+            app.input.clear();
+        }
+        // 체크박스에 있을 때 글자를 치면 입력창으로 돌아간다. 친 글자는 살린다.
+        KeyCode::Char(c) => {
+            app.idle_focus = 0;
+            app.input.push(c);
+        }
         _ => {}
     }
     Ok(())
@@ -307,6 +333,30 @@ fn on_key_new_space(app: &mut App, k: KeyEvent) -> Result<()> {
     Ok(())
 }
 
+/// 모두에게 묻기 상자.
+fn on_key_broadcast(app: &mut App, k: KeyEvent) -> Result<()> {
+    match k.code {
+        KeyCode::Esc => {
+            app.input.clear();
+            app.mode = Mode::Panes;
+        }
+        KeyCode::Enter => {
+            let q = app.input.trim().to_string();
+            if !q.is_empty() {
+                app.broadcast(&q);
+            }
+            app.input.clear();
+            app.mode = Mode::Panes;
+        }
+        KeyCode::Backspace => {
+            app.input.pop();
+        }
+        KeyCode::Char(c) => app.input.push(c),
+        _ => {}
+    }
+    Ok(())
+}
+
 /// 패널 화면 — 키는 포커스된 자식에게 그대로 간다.
 ///
 /// 우리 조작은 프리픽스(Ctrl+]) 뒤에 온다. 그러지 않으면 에이전트가 쓰는 키를
@@ -321,6 +371,13 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
                 app.input.clear();
             }
             KeyCode::Char('q') => app.quit = true,
+            // 프리픽스 뒤의 a 는 Ctrl+A 를 **자식에게** 보낸다.
+            // Ctrl+A 자체는 우리가 «모두에게 묻기»로 가져갔기 때문이다.
+            KeyCode::Char('a') => {
+                if let Some(s) = app.focused() {
+                    let _ = s.write(&[0x01]);
+                }
+            }
             // 프리픽스를 한 번 더 누르면 프리픽스 자체를 자식에게 보낸다.
             KeyCode::Char(']') => {
                 if let Some(s) = app.focused() {
@@ -352,14 +409,37 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
         }
     }
 
-    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char(']') {
-        app.prefix = true;
-        return Ok(());
+    if k.modifiers.contains(KeyModifiers::CONTROL) {
+        match k.code {
+            KeyCode::Char(']') => {
+                app.prefix = true;
+                return Ok(());
+            }
+            // 모두에게 한 번에 묻는다.
+            //
+            // 자식들도 Ctrl+A 를 쓸 수 있다(줄 맨 앞으로). 그 기능이 필요하면
+            // 프리픽스를 거쳐 Ctrl+] 다음 a 로 보낼 수 있게 열어 뒀다.
+            KeyCode::Char('a') => {
+                app.input.clear();
+                app.mode = Mode::Broadcast;
+                return Ok(());
+            }
+            _ => {}
+        }
     }
 
     if let Some(bytes) = encode_key(&k) {
+        // 글자를 친 것만 «직접 쓰기»로 센다. 화살표·Enter 는 대화상자에 답하는
+        // 조작이라 대기 중인 질문을 취소시키면 안 된다.
+        let typed = matches!(k.code, KeyCode::Char(_)) && !k.modifiers.contains(KeyModifiers::CONTROL);
+        let focus = app.focus;
         if let Some(s) = app.focused() {
             let _ = s.write(&bytes);
+        }
+        if typed {
+            if let Some(s) = app.sessions.get_mut(focus) {
+                s.user_typed = true;
+            }
         }
     }
     Ok(())
@@ -397,6 +477,7 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
             app.mode = Mode::NewSpace;
         }
         Some(Hit::AddSession) => app.mode = Mode::Picker,
+        Some(Hit::ToggleAgent(i)) => app.toggle_agent(i),
         None => {}
     }
 }

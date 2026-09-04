@@ -67,6 +67,12 @@ pub struct Session {
     pub seen: (usize, Instant),
     /// 화면에서 읽어낸 서브에이전트 명부. 화면이 바뀔 때만 갱신한다.
     pub subs: Vec<crate::subagents::Sub>,
+    /// 사용자가 이 칸에 직접 글자를 쳤는가.
+    ///
+    /// 쳤다면 대기 중인 질문은 넣지 않는다. 사용자가 이미 자기 뜻대로 쓰고
+    /// 있는데 뒤늦게 끼어드는 것은 방해다. 화살표·Enter 는 세지 않는다 —
+    /// 대화상자에 답하는 조작이지 「직접 쓰기」가 아니기 때문이다.
+    pub user_typed: bool,
 }
 
 impl Session {
@@ -81,6 +87,7 @@ impl Session {
             started: None,
             seen: (0, Instant::now()),
             subs: Vec::new(),
+            user_typed: false,
         }
     }
 
