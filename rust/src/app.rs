@@ -149,7 +149,9 @@ impl App {
         if !p.is_dir() {
             return Err(format!("디렉터리가 아니다: {}", p.display()));
         }
-        let p = p.canonicalize().unwrap_or(p);
+        // canonicalize 는 윈도우에서 `\\?\` 접두사를 붙인다. 경로를 지우고
+        // 다시 쓰기 위해 벗긴다.
+        let p = strip_verbatim(p.canonicalize().unwrap_or_else(|_| p.clone()));
         if let Some(i) = self.spaces.iter().position(|s| s.path == p) {
             self.select_space(i);
             return Ok(());
@@ -704,6 +706,25 @@ impl App {
     }
 }
 
+/// 윈도우 `\\\\?\\` 접두사를 벗긴다.
+///
+/// `canonicalize()` 는 길이 제한을 넘는 경로까지 다루려고 이 접두사를 붙여 준다.
+/// 우리에겐 해가 된다 — 화면에 그대로 나오고, 이 표기를 못 읽는 프로그램이 있어
+/// 자식의 작업 디렉터리로도 위험하다. 접두사만 떼고 나머지는 건드리지 않는다.
+///
+/// 네트워크 경로는 `\\\\?\\UNC\\` 형태로 오는데, 이때는 `\\\\` 로 되돌린다.
+pub fn strip_verbatim(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("\\\\?\\UNC\\") {
+        return PathBuf::from(format!("\\\\{rest}"));
+    }
+    match s.strip_prefix("\\\\?\\") {
+        // 드라이브 경로(C:\…)일 때만 뗀다. 그 밖의 장치 경로는 뜻이 달라진다.
+        Some(rest) if rest.len() >= 2 && rest.as_bytes()[1] == b':' => PathBuf::from(rest),
+        _ => p,
+    }
+}
+
 /// 선두의 `~` 를 홈 디렉터리로 바꾼다.
 ///
 /// `~/foo` 는 셸이 풀어주는 표기라 우리 손에는 **문자 그대로** 들어온다.
@@ -819,6 +840,25 @@ mod tests {
         assert!(!starts_with_ci("작", "작업"));
         assert!(starts_with_ci("Desktop", "desk"));
         assert!(starts_with_ci("anything", ""));
+    }
+
+    #[test]
+    fn verbatim_접두사를_벗긴다() {
+        let v = |s: &str| strip_verbatim(PathBuf::from(s)).to_string_lossy().into_owned();
+        assert_eq!(v(r"\\?\C:\Users\HJS"), r"C:\Users\HJS");
+        assert_eq!(v(r"\\?\UNC\server\share"), r"\\server\share");
+        // 원래 멀쩡한 경로는 그대로 둔다.
+        assert_eq!(v(r"C:\Users\HJS"), r"C:\Users\HJS");
+        // 드라이브가 아닌 장치 경로는 뜻이 달라지므로 손대지 않는다.
+        assert_eq!(v(r"\\?\PhysicalDrive0"), r"\\?\PhysicalDrive0");
+    }
+
+    #[test]
+    fn 새_공간_경로에_verbatim_이_남지_않는다() {
+        let mut app = App::new(&[("claude", "Claude")]);
+        app.add_space(".").expect("현재 디렉터리는 공간이 된다");
+        let p = app.active_path().to_string_lossy().into_owned();
+        assert!(!p.starts_with(r"\\?\"), "verbatim 이 남았다: {p}");
     }
 
     #[test]
