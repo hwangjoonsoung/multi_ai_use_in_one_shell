@@ -397,17 +397,10 @@ impl App {
         }
         let Some(pid) = s.pty.as_ref().and_then(|p| p.pid()) else { return };
 
+        // 진단(--probe)과 **같은 경로**를 쓴다. 갈라 두면 진단은 통과하는데
+        // 앱은 안 되는 상황이 생긴다.
         let sys = self.sys.get_or_insert_with(sysinfo::System::new);
-        let pid = sysinfo::Pid::from_u32(pid);
-        // **cwd 를 명시해서 달라고 해야 한다.** refresh_processes 의 기본 갱신
-        // 종류에는 cwd 가 없어 프로세스는 찾아도 cwd 가 None 으로 온다(실측).
-        // 메모리·CPU·디스크는 우리가 안 쓰므로 빼는 편이 싸기도 하다.
-        sys.refresh_processes_specifics(
-            sysinfo::ProcessesToUpdate::Some(&[pid]),
-            true,
-            sysinfo::ProcessRefreshKind::new().with_cwd(sysinfo::UpdateKind::Always),
-        );
-        let found = sys.process(pid).and_then(|p| p.cwd().map(PathBuf::from));
+        let found = crate::pty::process_cwd(sys, pid);
 
         let i = self.focus;
         if let Some(s) = self.sessions.get_mut(i) {

@@ -169,13 +169,66 @@ mai --quote claude          # 지금 디렉터리의 claude 세션에서 마지�
 mai --quote codex ~/proj
 ```
 
+#### `--probe` — 이 환경에서 «cd 따라가기» 가 되는가
+
+셸을 띄워 `cd ..` 를 보내고 프로세스 경로가 따라오는지 화면 없이 판정한다.
+셸을 찾고 · 자식 pid 를 얻고 · 그 프로세스의 cwd 를 읽는 **세 고리가 다 성립해야**
+공간이 `cd` 를 따라가는데, 하나라도 끊기면 증상이 「아무 일도 안 일어남」이라
+화면만 봐서는 어디가 문제인지 모른다.
+
+```bash
+mai --probe        # Windows 는 mai -Probe
+```
+
+```
+== 환경 점검 ==
+  플랫폼: macos
+  셸: /bin/zsh []
+  자식 pid: 39438
+  읽어낸 경로: …/multi_ai_use_in_one_shell/rust
+  «cd ..» 를 보낸다
+  cd .. 뒤:    …/multi_ai_use_in_one_shell
+  RESULT: cd 를 따라간다 — 공간 경로가 갱신된다
+```
+
+특히 Windows 의 PowerShell 은 `Set-Location` 이 셸 안의 위치만 바꾸고 Win32 프로세스
+cwd 는 그대로 두는 경우가 있다. 그러면 우리가 읽는 값이 안 바뀐다 — 그 판정을 하려고
+만든 것이다.
+
 `MAI_KEYLOG=/tmp/keys.log` 를 주면 받은 키를 그대로 적는다. 단축키가 안 먹을 때 쓴다 —
 키 이름은 터미널·플랫폼마다 다르게 들어온다.
+
+### Windows — Rust 판
+
+```powershell
+.\scripts\install.ps1                # %LOCALAPPDATA%\mai\bin\mai.cmd 심 생성
+.\scripts\install.ps1 -AddToPath     # 사용자 PATH 에 넣기까지
+```
+
+그 뒤로는 macOS 와 같이 `mai` 한 단어다. 앱의 플래그는 **전부 스위치로 열어 뒀다** —
+PowerShell 은 `--quote` 같은 토큰을 자기 파라미터로 해석하려다 실패하므로
+raw 플래그를 칠 일이 없어야 한다.
+
+```powershell
+mai                     # 여기를 공간으로 실행
+mai C:\proj             # 다른 디렉터리를 공간으로
+mai -Which              # 참여자를 어떻게 띄우는지
+mai -Probe              # 셸과 «cd 따라가기» 가 이 환경에서 되는지
+mai -Quote claude       # 답 넘기기가 무엇을 꺼내는지
+mai -Doctor -Rebuild -Selftest -Trust -Rooms
+```
+
+심링크가 아니라 `.cmd` 심을 쓴다. Windows 에서 심링크는 관리자 권한이나 개발자 모드가
+필요해 되는 사람과 안 되는 사람이 갈린다. `-AsFunction` 으로 `$PROFILE` 에 함수를
+넣을 수도 있고 `-Uninstall` 로 둘 다 되돌린다.
+
+> ⚠ **이 `.ps1` 들은 아직 Windows 에서 실행 검증하지 않았다.** 작성 환경에 PowerShell 이
+> 없었다. 첫 실행에서 손볼 것이 나올 수 있다. Rust 코드 자체는 Windows 타깃으로
+> `cargo check` 가 통과한다.
 
 ### Windows — Java 판 (참조용)
 
 ```powershell
-.\scripts\doctor.ps1                 # CLI 설치·인증·모델 점검
 .\scripts\compile.ps1                # javac (외부 라이브러리 없음, D12)
 .\scripts\run.ps1                    # 현재 디렉터리를 워크스페이스로 실행
 .\scripts\run.ps1 -Workspace C:\proj  # 대상 워크스페이스 지정 (D18)

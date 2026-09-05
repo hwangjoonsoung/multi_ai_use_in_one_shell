@@ -13,6 +13,7 @@
 //!   multi_ai_cli --quote <에이전트> [경로]  인용 전달이 무엇을 꺼내는지 확인
 //!   multi_ai_cli --trust       현재 디렉터리를 각 에이전트에 신뢰 등록
 //!   multi_ai_cli --selftest    PTY+VT 파이프라인 자동 점검
+//!   multi_ai_cli --probe       셸과 «cd 따라가기» 가 이 환경에서 되는지 점검
 
 mod app;
 mod modal;
@@ -65,6 +66,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--selftest") => return selftest(),
+        Some("--probe") => return probe(),
         Some("--complete") => {
             // 경로 탭 완성을 화면 없이 확인한다. `~` 확장도 여기서 드러난다.
             let mut app = App::new(AGENTS);
@@ -778,6 +780,88 @@ fn run_converge(raw: &str) -> Result<()> {
     }
     outln!("  · 기록: {}", r.transcript().display());
     Ok(())
+}
+
+// ---------- 환경 점검 ----------
+
+/// 셸을 띄워 «cd 하면 공간이 따라가는가» 를 화면 없이 판정한다.
+///
+/// 이 기능은 세 고리가 다 성립해야 돈다 — 셸을 찾고, 자식 pid 를 얻고,
+/// 그 프로세스의 cwd 를 읽는 것. 하나라도 끊기면 증상이 «아무 일도 안 일어남»
+/// 이라 화면만 봐서는 어디가 문제인지 모른다.
+///
+/// 특히 Windows 의 PowerShell 은 `Set-Location` 이 셸 안의 위치만 바꾸고 Win32
+/// 프로세스 cwd 는 그대로 두는 경우가 있다. 그러면 우리가 읽는 값이 안 바뀐다.
+/// 그 판정을 하려고 만든 것이다.
+fn probe() -> Result<()> {
+    outln!("== 환경 점검 ==");
+    outln!("  플랫폼: {}", std::env::consts::OS);
+
+    let Some((exe, args)) = pty::resolve_shell() else {
+        outln!("  [FAIL] 셸을 찾지 못했다");
+        anyhow::bail!("셸 없음");
+    };
+    outln!("  셸: {} {args:?}", exe.display());
+
+    let cwd = std::env::current_dir()?;
+    outln!("  기동 경로: {}", cwd.display());
+
+    let mut s = pty::PtySession::spawn_shell_in(24, 80, &cwd)?;
+    let Some(pid) = s.pid() else {
+        outln!("  [FAIL] 자식 pid 를 얻지 못했다");
+        anyhow::bail!("pid 없음");
+    };
+    outln!("  자식 pid: {pid}");
+
+    // 셸이 자리를 잡을 때까지 기다린다. 프롬프트가 나오면 준비된 것이다.
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        s.pump();
+    }
+
+    let mut sys = sysinfo::System::new();
+    let before = pty::process_cwd(&mut sys, pid);
+    match &before {
+        Some(p) => outln!("  읽어낸 경로: {}", p.display()),
+        None => {
+            outln!("  [FAIL] 프로세스 경로를 읽지 못했다");
+            outln!("         → 공간이 cd 를 따라갈 수 없다. 나머지 기능은 그대로 동작한다.");
+            anyhow::bail!("cwd 를 읽지 못했다");
+        }
+    }
+
+    // 한 칸 위로 옮겨 보고 값이 따라오는지 본다. `cd ..` 는 어느 셸에서나 같다.
+    outln!("");
+    outln!("  «cd ..» 를 보낸다");
+    s.write(b"cd ..\r")?;
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        s.pump();
+    }
+    let after = pty::process_cwd(&mut sys, pid);
+    match &after {
+        Some(p) => outln!("  cd .. 뒤:    {}", p.display()),
+        None => outln!("  cd .. 뒤:    (읽지 못함)"),
+    }
+
+    outln!("");
+    let ok = match (&before, &after) {
+        (Some(b), Some(a)) if a != b => {
+            outln!("  RESULT: cd 를 따라간다 — 공간 경로가 갱신된다");
+            true
+        }
+        (Some(_), Some(_)) => {
+            outln!("  RESULT: 셸이 cd 해도 프로세스 경로가 그대로다");
+            outln!("          → 공간 경로가 안 따라간다. PowerShell 에서 흔한 일이다.");
+            outln!("          → cmd.exe 를 쓰거나(COMSPEC), 그대로 두고 [+] 로 새 공간을 지정한다.");
+            false
+        }
+        _ => {
+            outln!("  RESULT: 판정 불가");
+            false
+        }
+    };
+    if ok { Ok(()) } else { anyhow::bail!("cd 를 따라가지 못한다") }
 }
 
 // ---------- 셀프테스트 ----------

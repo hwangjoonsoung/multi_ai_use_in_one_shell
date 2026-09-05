@@ -42,13 +42,31 @@ if (Get-Command agy -ErrorAction SilentlyContinue) {
 }
 
 Write-Host ""
-Write-Host "== Java =="
+Write-Host "== Rust 툴체인 (현행 구현) =="
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+    if (Test-Path (Join-Path $cargoBin 'cargo.exe')) { $env:Path = "$cargoBin;$env:Path" }
+}
+if (Get-Command cargo -ErrorAction SilentlyContinue) {
+    Write-Host ("  {0,-8} {1}" -f 'cargo', (& cargo --version))
+    Write-Host ("  {0,-8} {1}" -f 'rustc', (& rustc --version))
+} else {
+    Write-Host "  MISSING — Rust 판을 빌드할 수 없다. 설치:"
+    Write-Host "    winget install Rustlang.Rustup"
+}
+
+Write-Host ""
+Write-Host "== Java (참조용 Java 판) =="
 $java = 'java'
 if ($env:JAVA_HOME) {
     $c = Join-Path $env:JAVA_HOME 'bin\java.exe'
     if (Test-Path $c) { $java = $c }
 }
-& $java -version 2>&1 | ForEach-Object { Write-Host "  $_" }
+if (Get-Command $java -ErrorAction SilentlyContinue) {
+    & $java -version 2>&1 | ForEach-Object { Write-Host "  $_" }
+} else {
+    Write-Host "  MISSING (Rust 판만 쓸 거면 없어도 된다)"
+}
 
 Write-Host ""
 Write-Host "== 저장 위치 =="

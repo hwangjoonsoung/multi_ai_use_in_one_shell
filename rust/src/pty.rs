@@ -299,6 +299,24 @@ pub fn resolve_agent(agent: &str) -> Option<(PathBuf, Vec<String>)> {
     }
 }
 
+/// 프로세스가 지금 들어가 있는 경로.
+///
+/// **cwd 는 명시해서 달라고 해야 준다.** `refresh_processes` 의 기본 갱신
+/// 종류에는 cwd 가 없어서 프로세스는 찾아도 `cwd()` 가 None 으로 온다(실측).
+/// 메모리·CPU·디스크는 우리가 안 쓰므로 빼는 편이 싸기도 하다.
+///
+/// `sys` 를 밖에서 받는 것은 매번 새로 만들면 비싸기 때문이다. 앱은 하나를
+/// 계속 들고 쓰고, 진단은 그때그때 만든다.
+pub fn process_cwd(sys: &mut sysinfo::System, pid: u32) -> Option<PathBuf> {
+    let pid = sysinfo::Pid::from_u32(pid);
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::new().with_cwd(sysinfo::UpdateKind::Always),
+    );
+    sys.process(pid).and_then(|p| p.cwd().map(PathBuf::from))
+}
+
 /// 휠 한 칸을 자식이 고른 인코딩으로 바꾼다.
 ///
 /// 휠은 버튼 64(위)/65(아래)로 보고하고 좌표는 1-기준이다. SGR 은 좌표에 상한이
@@ -581,15 +599,7 @@ mod cwd_tests {
         }
 
         let mut sys = sysinfo::System::new();
-        let p = sysinfo::Pid::from_u32(pid);
-        sys.refresh_processes_specifics(
-            sysinfo::ProcessesToUpdate::Some(&[p]),
-            true,
-            sysinfo::ProcessRefreshKind::new().with_cwd(sysinfo::UpdateKind::Always),
-        );
-        let proc = sys.process(p);
-        eprintln!("프로세스 찾음 = {}", proc.is_some());
-        let cwd = proc.and_then(|x| x.cwd().map(|c| c.to_path_buf()));
+        let cwd = process_cwd(&mut sys, pid);
         eprintln!("cwd = {cwd:?}");
         assert!(cwd.is_some(), "cwd 를 못 읽었다 — 공간이 cd 를 따라갈 수 없다");
         assert!(cwd.unwrap().ends_with("usr"), "띄운 자리와 다르다");
