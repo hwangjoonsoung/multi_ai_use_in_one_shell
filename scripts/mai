@@ -29,13 +29,22 @@ fi
 rebuild=0
 args=()
 workspace=""
+
+# **첫 인자가 플래그면 전부 그대로 넘긴다.**
+#
+# 예전엔 «옵션이 아닌 첫 인자» 를 공간 경로로 봤다. 그러면 인자를 받는
+# 하위 명령이 깨진다 — `mai --quote claude` 의 claude 가 경로로 잡혀
+# `cd claude` 로 죽었다. 경로를 주는 것은 첫 자리뿐이라는 규칙이 더 단순하다.
+if [[ $# -gt 0 && "$1" != -* ]]; then
+    workspace="$1"
+    shift
+fi
+
 for a in "$@"; do
     case "$a" in
         --rebuild) rebuild=1 ;;
         --doctor)  exec bash "$root/scripts/doctor.sh" ;;
-        # 옵션이 아닌 첫 인자는 공간 경로로 본다.
-        -*) args+=("$a") ;;
-        *) [[ -z "$workspace" ]] && workspace="$a" || args+=("$a") ;;
+        *) args+=("$a") ;;
     esac
 done
 
