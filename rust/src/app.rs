@@ -104,6 +104,10 @@ pub struct App {
     relay_preview: Option<String>,
     /// 넘길 인용문과 그 출처 이름. 문장은 보낼 때 붙인다.
     relay_quote: Option<(String, crate::relay::Quote)>,
+    /// 인용을 받을 후보. (세션 인덱스, 표시명, 켜짐)
+    relay_targets: Vec<(usize, String, bool)>,
+    /// 인용 상자의 포커스. 0 은 문장 입력, 1.. 은 n-1 번째 후보다.
+    pub relay_focus: usize,
 }
 
 impl App {
@@ -135,6 +139,8 @@ impl App {
             last_area: Rect::ZERO,
             relay_preview: None,
             relay_quote: None,
+            relay_targets: Vec::new(),
+            relay_focus: 0,
         }
     }
 
@@ -444,6 +450,8 @@ impl App {
     pub fn prepare_relay(&mut self) {
         self.relay_preview = None;
         self.relay_quote = None;
+        self.relay_targets.clear();
+        self.relay_focus = 0;
 
         let Some(src) = self.sessions.get(self.focus) else {
             self.status = "넘길 칸이 없다".into();
@@ -472,14 +480,48 @@ impl App {
         let cut = if quote.truncated { " · 앞부분 생략" } else { "" };
         self.relay_preview = Some(format!("{title} 의 답 {n}자 ({}{cut})", quote.origin.label()));
         self.relay_quote = Some((title, quote));
+
+        // 출처를 뺀 나머지가 후보다. 처음엔 전부 켜 둔다 — 흔한 쓰임이
+        // «나머지 전원에게 물어본다» 이고, 좁히는 건 그다음이다.
+        let src_i = self.focus;
+        self.relay_targets = self
+            .visible()
+            .into_iter()
+            .filter(|&i| i != src_i && self.sessions[i].pty.is_some())
+            .map(|i| (i, self.sessions[i].title.clone(), true))
+            .collect();
+
         self.mode = Mode::Relay;
         self.input.clear();
+    }
+
+    /// 인용 상자 안에서 포커스를 옮긴다. 문장 → 후보들 → 다시 문장.
+    pub fn cycle_relay_focus(&mut self, delta: i32) {
+        let n = self.relay_targets.len() as i32 + 1;
+        self.relay_focus = (((self.relay_focus as i32 + delta) % n + n) % n) as usize;
+    }
+
+    /// 포커스된 후보를 켜고 끈다.
+    pub fn toggle_relay_target(&mut self) {
+        if self.relay_focus == 0 {
+            return;
+        }
+        if let Some(t) = self.relay_targets.get_mut(self.relay_focus - 1) {
+            t.2 = !t.2;
+        }
+    }
+
+    /// 지금 켜져 있는 후보 수.
+    pub fn relay_selected(&self) -> usize {
+        self.relay_targets.iter().filter(|t| t.2).count()
     }
 
     /// 인용 전달을 물린다.
     pub fn cancel_relay(&mut self) {
         self.relay_preview = None;
         self.relay_quote = None;
+        self.relay_targets.clear();
+        self.relay_focus = 0;
         self.mode = Mode::Panes;
     }
 
@@ -489,18 +531,25 @@ impl App {
     ///
     /// 직접 쓰지 않고 대기 프롬프트로 걸어 두는 것은 broadcast 와 같은 이유다 —
     /// 대화상자가 떠 있는 칸에서는 상자가 닫힐 때까지 기다려야 한다.
-    pub fn relay(&mut self, sentence: &str) {
-        let Some((title, quote)) = self.relay_quote.take() else { return };
+    pub fn relay(&mut self, sentence: &str) -> bool {
+        if self.relay_selected() == 0 {
+            self.status = "받을 칸을 하나 이상 골라야 한다 (Tab 이동 · Space 켜기/끄기)".into();
+            return false;
+        }
+        let Some((title, quote)) = self.relay_quote.take() else { return false };
         let body = crate::relay::compose(&title, &quote, sentence);
 
         let now = Instant::now();
-        let src = self.focus;
-        let mut n = 0;
-        for i in self.visible() {
-            if i == src {
-                continue;
-            }
-            let s = &mut self.sessions[i];
+        let targets: Vec<usize> = self
+            .relay_targets
+            .iter()
+            .filter(|t| t.2)
+            .map(|t| t.0)
+            .collect();
+        let mut names = Vec::new();
+        for i in targets {
+            // 상자가 떠 있는 동안 칸이 닫혔을 수 있다. 인덱스를 다시 본다.
+            let Some(s) = self.sessions.get_mut(i) else { continue };
             if s.pty.is_none() {
                 continue;
             }
@@ -509,14 +558,16 @@ impl App {
             s.started = Some(now);
             s.seen = (rx, now);
             s.user_typed = false;
-            n += 1;
+            names.push(s.title.clone());
         }
-        self.status = if n == 0 {
+        self.status = if names.is_empty() {
             "받을 칸이 없다".into()
         } else {
-            format!("{title} 의 답을 {n}개 칸에 넘겼다")
+            format!("{title} 의 답을 {} 에게 넘겼다", names.join(", "))
         };
         self.relay_preview = None;
+        self.relay_targets.clear();
+        true
     }
 
     // ---------- 마우스 ----------
@@ -595,11 +646,7 @@ impl App {
             }
             Mode::Relay => {
                 self.draw_panes(f);
-                let title = match &self.relay_preview {
-                    Some(p) => format!(" {p} → 나머지 칸 (Enter 보내기 · Esc 취소) "),
-                    None => " 넘길 답변을 찾지 못했다 (Esc) ".to_string(),
-                };
-                self.draw_prompt_box(f, &title);
+                self.draw_relay_box(f);
             }
         }
     }
@@ -799,6 +846,74 @@ impl App {
             })
             .collect();
         f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// 인용 전달 상자 — 받을 칸을 고르고 한 문장을 적는다.
+    ///
+    /// 대상 지정을 **Alt+숫자 같은 조합키로 하지 않는다.** macOS 터미널은 기본
+    /// 설정에서 Option 을 Meta 로 보내지 않아 그 키가 통째로 안 오는 환경이 있다.
+    /// Tab 으로 옮기고 Space 로 켜고 끄는 방식은 어디서나 같게 동작한다.
+    fn draw_relay_box(&self, f: &mut Frame) {
+        let area = f.area();
+        let title = match &self.relay_preview {
+            Some(p) => format!(" {p} "),
+            None => " 넘길 답변을 찾지 못했다 (Esc) ".to_string(),
+        };
+        let r = center(area, area.width.min(80), 6);
+        f.render_widget(Clear, r);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Green))
+            .title(title);
+        let inner = block.inner(r);
+        f.render_widget(block, r);
+
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
+            .split(inner);
+
+        // 받을 칸 — 켜진 것만 인용을 받는다.
+        let mut spans: Vec<Span> = vec![Span::styled(
+            "받을 칸  ",
+            Style::default().fg(Color::DarkGray),
+        )];
+        for (i, (_, name, on)) in self.relay_targets.iter().enumerate() {
+            let focused = self.relay_focus == i + 1;
+            let mut st = Style::default().fg(if *on { Color::Green } else { Color::DarkGray });
+            if focused {
+                st = st.add_modifier(Modifier::REVERSED | Modifier::BOLD);
+            }
+            spans.push(Span::styled(
+                format!("[{}] {name}", if *on { "x" } else { " " }),
+                st,
+            ));
+            spans.push(Span::raw("   "));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
+
+        // 한 문장.
+        let on_input = self.relay_focus == 0;
+        let mut spans: Vec<Span> = vec![Span::styled(
+            "한 마디  ",
+            Style::default().fg(if on_input { Color::Cyan } else { Color::DarkGray }),
+        )];
+        spans.push(Span::raw(self.input.as_str()));
+        f.render_widget(Paragraph::new(Line::from(spans)), rows[1]);
+
+        f.render_widget(
+            Paragraph::new("Tab 이동 · Space 켜기/끄기 · Enter 보내기 · Esc 취소")
+                .style(Style::default().fg(Color::DarkGray)),
+            rows[2],
+        );
+
+        if on_input {
+            // "한 마디  " 만큼 오른쪽에서 시작한다.
+            let off = UnicodeWidthStr::width("한 마디  ") as u16;
+            let field = Rect { x: rows[1].x + off, width: rows[1].width.saturating_sub(off), ..rows[1] };
+            put_cursor(f, field, &self.input);
+        }
     }
 
     /// 새 공간 경로 입력 상자.

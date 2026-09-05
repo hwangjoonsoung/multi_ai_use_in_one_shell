@@ -361,14 +361,30 @@ fn on_key_relay(app: &mut App, k: KeyEvent) -> Result<()> {
         KeyCode::Enter => {
             let q = app.input.trim().to_string();
             // 문장이 비어도 보낸다. 인용만 넘기고 싶을 수 있다.
-            app.relay(&q);
-            app.input.clear();
-            app.mode = Mode::Panes;
+            // 대상이 하나도 없으면 relay 가 이유를 남기고 상자를 지킨다.
+            if app.relay(&q) {
+                app.input.clear();
+                app.mode = Mode::Panes;
+            }
         }
+        // 문장 칸과 대상 칩 사이를 오간다.
+        KeyCode::Tab => app.cycle_relay_focus(1),
+        KeyCode::BackTab => app.cycle_relay_focus(-1),
+        KeyCode::Right if app.relay_focus > 0 => app.cycle_relay_focus(1),
+        KeyCode::Left if app.relay_focus > 0 => app.cycle_relay_focus(-1),
+        KeyCode::Down => app.cycle_relay_focus(1),
+        KeyCode::Up => app.cycle_relay_focus(-1),
+        // Space 는 칩 위에서만 켜기/끄기다. 문장 칸에서는 띄어쓰기다.
+        KeyCode::Char(' ') if app.relay_focus > 0 => app.toggle_relay_target(),
         KeyCode::Backspace => {
+            app.relay_focus = 0;
             app.input.pop();
         }
-        KeyCode::Char(c) => app.input.push(c),
+        // 칩에 있을 때 글자를 치면 문장 칸으로 돌아온다. 친 글자는 살린다.
+        KeyCode::Char(c) => {
+            app.relay_focus = 0;
+            app.input.push(c);
+        }
         _ => {}
     }
     Ok(())
