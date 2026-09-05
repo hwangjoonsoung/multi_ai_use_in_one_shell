@@ -44,6 +44,8 @@ pub enum Mode {
     NewSpace,
     /// 보이는 모든 에이전트에게 한 번에 묻는 중
     Broadcast,
+    /// 포커스된 칸의 마지막 답변을 나머지 칸으로 넘기는 중
+    Relay,
 }
 
 /// 마우스 클릭이 무엇을 가리키는가.
@@ -98,6 +100,10 @@ pub struct App {
     agents_area: Rect,
     /// 마지막으로 그린 전체 영역. 키로 칸을 붙일 때 크기 계산에 쓴다.
     last_area: Rect,
+    /// 인용 전달 상자에 띄울 요약. 무엇을 어디서 몇 자 가져왔는지.
+    relay_preview: Option<String>,
+    /// 넘길 인용문과 그 출처 이름. 문장은 보낼 때 붙인다.
+    relay_quote: Option<(String, crate::relay::Quote)>,
 }
 
 impl App {
@@ -127,6 +133,8 @@ impl App {
             spaces_area: Rect::ZERO,
             agents_area: Rect::ZERO,
             last_area: Rect::ZERO,
+            relay_preview: None,
+            relay_quote: None,
         }
     }
 
@@ -428,6 +436,89 @@ impl App {
         };
     }
 
+    /// 포커스된 칸의 마지막 답변을 꺼내 «넘길 준비»를 한다.
+    ///
+    /// 상자를 열기 전에 미리 꺼내는 이유는, 넘길 것이 없으면 상자를 띄우는
+    /// 것 자체가 헛수고이기 때문이다. 몇 자를 어디서 가져왔는지도 이때 정해져
+    /// 상자 제목에 그대로 나온다.
+    pub fn prepare_relay(&mut self) {
+        self.relay_preview = None;
+        self.relay_quote = None;
+
+        let Some(src) = self.sessions.get(self.focus) else {
+            self.status = "넘길 칸이 없다".into();
+            return;
+        };
+        if self.visible().len() < 2 {
+            self.status = "받을 칸이 없다. 칸이 둘 이상이어야 한다.".into();
+            return;
+        }
+        let title = src.title.clone();
+        let cwd = self.active_path();
+
+        // 1순위 세션 기록, 2순위 화면. relay 모듈이 그 순서를 안다.
+        let quote = crate::relay::last_answer(&src.agent_id, &cwd)
+            .or_else(|| src.pty.as_ref().map(|p| crate::relay::from_screen(&p.screen())));
+        let Some(quote) = quote else {
+            self.status = format!("{title} 에서 넘길 답변을 찾지 못했다");
+            return;
+        };
+        if quote.text.trim().is_empty() {
+            self.status = format!("{title} 의 답변이 비어 있다");
+            return;
+        }
+
+        let n = quote.text.chars().count();
+        let cut = if quote.truncated { " · 앞부분 생략" } else { "" };
+        self.relay_preview = Some(format!("{title} 의 답 {n}자 ({}{cut})", quote.origin.label()));
+        self.relay_quote = Some((title, quote));
+        self.mode = Mode::Relay;
+        self.input.clear();
+    }
+
+    /// 인용 전달을 물린다.
+    pub fn cancel_relay(&mut self) {
+        self.relay_preview = None;
+        self.relay_quote = None;
+        self.mode = Mode::Panes;
+    }
+
+    /// 준비된 인용문에 한 문장을 붙여 **나머지 보이는 칸 전부**에 넣는다.
+    ///
+    /// 출처 칸에는 넣지 않는다. 자기 답을 자기에게 다시 주는 꼴이다.
+    ///
+    /// 직접 쓰지 않고 대기 프롬프트로 걸어 두는 것은 broadcast 와 같은 이유다 —
+    /// 대화상자가 떠 있는 칸에서는 상자가 닫힐 때까지 기다려야 한다.
+    pub fn relay(&mut self, sentence: &str) {
+        let Some((title, quote)) = self.relay_quote.take() else { return };
+        let body = crate::relay::compose(&title, &quote, sentence);
+
+        let now = Instant::now();
+        let src = self.focus;
+        let mut n = 0;
+        for i in self.visible() {
+            if i == src {
+                continue;
+            }
+            let s = &mut self.sessions[i];
+            if s.pty.is_none() {
+                continue;
+            }
+            let rx = s.pty.as_ref().map(|p| p.rx_bytes).unwrap_or(0);
+            s.pending = Some(body.clone());
+            s.started = Some(now);
+            s.seen = (rx, now);
+            s.user_typed = false;
+            n += 1;
+        }
+        self.status = if n == 0 {
+            "받을 칸이 없다".into()
+        } else {
+            format!("{title} 의 답을 {n}개 칸에 넘겼다")
+        };
+        self.relay_preview = None;
+    }
+
     // ---------- 마우스 ----------
 
     pub fn hit_test(&self, x: u16, y: u16) -> Option<Hit> {
@@ -502,6 +593,14 @@ impl App {
                 self.draw_panes(f);
                 self.draw_prompt_box(f, " 모두에게 묻기 (Enter 보내기 · Esc 취소) ");
             }
+            Mode::Relay => {
+                self.draw_panes(f);
+                let title = match &self.relay_preview {
+                    Some(p) => format!(" {p} → 나머지 칸 (Enter 보내기 · Esc 취소) "),
+                    None => " 넘길 답변을 찾지 못했다 (Esc) ".to_string(),
+                };
+                self.draw_prompt_box(f, &title);
+            }
         }
     }
 
@@ -546,7 +645,7 @@ impl App {
         self.draw_bodies(f, right[1]);
 
         let hint = if self.prefix {
-            "Ctrl+] 눌림 — t 터미널 · p 에이전트 · n 모두에게 묻기 · a Ctrl+A 를 자식에게 · q 종료 · 1..9 포커스"
+            "Ctrl+] 눌림 — f 답 넘기기 · t 터미널 · p 에이전트 · n 모두에게 묻기 · a Ctrl+A 를 자식에게 · q 종료 · 1..9 포커스"
                 .to_string()
         } else {
             self.status.clone()

@@ -10,6 +10,7 @@
 //!   multi_ai_cli --rooms       저장된 방 목록
 //!   multi_ai_cli --show <ID>   방 기록 보기
 //!   multi_ai_cli --which       각 에이전트를 어떻게 띄우는지 확인
+//!   multi_ai_cli --quote <에이전트> [경로]  인용 전달이 무엇을 꺼내는지 확인
 //!   multi_ai_cli --trust       현재 디렉터리를 각 에이전트에 신뢰 등록
 //!   multi_ai_cli --selftest    PTY+VT 파이프라인 자동 점검
 
@@ -21,6 +22,7 @@ mod converge;
 mod room;
 mod sidebar;
 mod pty;
+mod relay;
 mod trust;
 mod vtscreen;
 
@@ -104,6 +106,35 @@ fn main() -> Result<()> {
                         outln!("      {} {} [{}]", b.kind, b.desc, if b.running { "도는 중" } else { "끝" });
                     }
                 }
+            }
+            return Ok(());
+        }
+        Some("--quote") => {
+            // 인용 전달이 무엇을 꺼내는지 화면 없이 확인한다.
+            //
+            // JSONL 은 비공개 내부 규약이라 CLI 가 올라가면 조용히 깨진다.
+            // 그때 "왜 화면에서만 가져오지" 를 추측하지 않으려고 남긴다.
+            let agent = args.get(1).cloned().unwrap_or_else(|| "claude".into());
+            let cwd = match args.get(2) {
+                Some(p) => app::expand_tilde(p),
+                None => std::env::current_dir()?,
+            };
+            outln!("  대상: {agent}  경로: {}", cwd.display());
+            match relay::last_answer(&agent, &cwd) {
+                Some(q) => {
+                    outln!(
+                        "  출처: {}  {}자{}",
+                        q.origin.label(),
+                        q.text.chars().count(),
+                        if q.truncated { " (앞부분 생략)" } else { "" }
+                    );
+                    outln!("  ── 앞 400자 ──");
+                    let head: String = q.text.chars().take(400).collect();
+                    for l in head.lines() {
+                        outln!("  {l}");
+                    }
+                }
+                None => outln!("  세션 기록에서 찾지 못했다 — 실제로는 화면 버퍼로 떨어진다"),
             }
             return Ok(());
         }
@@ -234,6 +265,7 @@ fn run(term: &mut Term) -> Result<()> {
                     Mode::Picker => on_key_picker(&mut app, k, term)?,
                     Mode::NewSpace => on_key_new_space(&mut app, k)?,
                     Mode::Broadcast => on_key_broadcast(&mut app, k)?,
+                    Mode::Relay => on_key_relay(&mut app, k)?,
                 }
             }
             Event::Mouse(m) => on_mouse(&mut app, m),
@@ -316,6 +348,32 @@ fn on_key_broadcast(app: &mut App, k: KeyEvent) -> Result<()> {
     Ok(())
 }
 
+/// 인용 전달 상자 — 한 문장만 받는다.
+///
+/// 인용문은 상자를 열 때 이미 꺼내 뒀다. 여기서 받는 건 «넌 어떻게 생각해?»
+/// 한 줄이고, 그게 인용문 뒤에 붙어 나머지 칸으로 간다.
+fn on_key_relay(app: &mut App, k: KeyEvent) -> Result<()> {
+    match k.code {
+        KeyCode::Esc => {
+            app.input.clear();
+            app.cancel_relay();
+        }
+        KeyCode::Enter => {
+            let q = app.input.trim().to_string();
+            // 문장이 비어도 보낸다. 인용만 넘기고 싶을 수 있다.
+            app.relay(&q);
+            app.input.clear();
+            app.mode = Mode::Panes;
+        }
+        KeyCode::Backspace => {
+            app.input.pop();
+        }
+        KeyCode::Char(c) => app.input.push(c),
+        _ => {}
+    }
+    Ok(())
+}
+
 /// 패널 화면 — 키는 포커스된 자식에게 그대로 간다.
 ///
 /// 우리 조작은 프리픽스(Ctrl+]) 뒤에 온다. 그러지 않으면 에이전트가 쓰는 키를
@@ -339,6 +397,8 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
             }
             // p 에이전트 선택 상자. 닫은 참여자를 되살릴 때 쓴다.
             KeyCode::Char('p') => app.mode = Mode::Picker,
+            // f 이 칸의 마지막 답변을 나머지 칸으로 넘긴다.
+            KeyCode::Char('f') => app.prepare_relay(),
             // 프리픽스 뒤의 a 는 Ctrl+A 를 **자식에게** 보낸다.
             // Ctrl+A 자체는 우리가 «모두에게 묻기»로 가져갔기 때문이다.
             KeyCode::Char('a') => {
