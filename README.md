@@ -8,7 +8,31 @@ Claude · Codex · Gemini(agy) 세 AI가 한 채팅방에 참여자로 들어와
 
 현행 구현은 **Rust 판**(`rust/`)이다. 아래 Java 판 명령은 참조용으로 남겨 둔다.
 
-### macOS / Linux — Rust 판
+### 설치 — 한 단어로 띄우기 (권장)
+
+```bash
+./scripts/install.sh          # ~/.local/bin/mai 심링크
+```
+
+그 뒤로는 **어느 디렉터리에서든** `mai` 한 단어면 된다. 빌드가 필요하면 알아서 하고 바로 띄운다.
+
+```bash
+cd ~/any/project
+mai                # 여기를 공간으로 실행
+mai ~/other        # 다른 디렉터리를 공간으로
+mai --which        # 참여자를 어떻게 띄우는지
+mai --doctor       # 설치·인증·툴체인 점검
+mai --rebuild      # 강제로 다시 빌드하고 실행
+```
+
+`mai` 는 **cwd 를 바꾸지 않는다.** 앱이 자기 작업 디렉터리를 첫 공간으로 잡으므로
+어디서 쳤는지가 곧 어느 프로젝트인지다. 빌드만 서브셸에서 저장소로 들어간다.
+
+심링크 대신 alias 를 쓰려면 `./scripts/install.sh --alias`, 되돌리려면 `--uninstall`.
+심링크를 기본으로 삼은 이유는 alias 가 대화형 셸에서만 살아 있어 스크립트나 다른
+도구가 부를 때는 없는 것이 되기 때문이다.
+
+### macOS / Linux — Rust 판 (스크립트 직접 호출)
 
 ```bash
 ./scripts/doctor.sh                        # CLI 설치·인증·모델 + Rust 툴체인 점검
