@@ -1,10 +1,15 @@
 //! 앱 상태와 화면. 「공간 × 세션」 구조다.
 //!
 //! 화면 모드
-//!   Idle     — 질문 입력만 있는 시작 화면
-//!   Panes    — 선택된 공간의 세션들. 그 안은 에이전트의 실제 TUI 다.
+//!   Panes    — 기본 화면. 선택된 공간의 세션들. 그 안은 에이전트의 실제 TUI 다.
 //!   Picker   — `+` 를 눌러 어떤 에이전트를 띄울지 고르는 중
 //!   NewSpace — 새 공간의 경로를 입력하는 중
+//!   Broadcast— 보이는 모든 에이전트에게 한 번에 묻는 중
+//!
+//! **시작하자마자 Panes 다.** 예전엔 질문을 먼저 받는 Idle 화면을 거쳤는데,
+//! 그 화면은 에이전트를 띄우기 위한 관문일 뿐이라 한 번 쓰고 다시 볼 일이
+//! 없었다. 지금은 기동과 동시에 쓸 수 있는 참여자를 전부 띄우고, 각 칸에는
+//! 에이전트 자신의 첫 화면이 그대로 보인다. 질문은 Ctrl+A 로 언제든 넣는다.
 //!
 //! 키는 기본적으로 **포커스된 세션의 자식에게 그대로** 간다. 그래야 권한 승인·
 //! 슬래시 자동완성·esc 중단이 동작한다. 우리 조작은 tmux 처럼 프리픽스로 뺀다.
@@ -34,7 +39,6 @@ use unicode_width::UnicodeWidthStr;
 pub const MAX_SPLIT: usize = 3;
 
 pub enum Mode {
-    Idle,
     Panes,
     Picker,
     NewSpace,
@@ -56,8 +60,6 @@ pub enum Hit {
     AddSession,
     /// 전체 보기 탭
     ShowAll,
-    /// 시작 화면에서 에이전트 켜기/끄기
-    ToggleAgent(usize),
 }
 
 pub struct App {
@@ -71,7 +73,7 @@ pub struct App {
     pub focus: usize,
 
     pub mode: Mode,
-    /// 시작 화면·공간 추가에서 타이핑 중인 문자열
+    /// 공간 추가·모두에게 묻기에서 타이핑 중인 문자열
     pub input: String,
     pub status: String,
     pub prefix: bool,
@@ -82,10 +84,6 @@ pub struct App {
     pub agent_scroll: u16,
     /// 탭 모드에서도 전부 나란히 본다. [전체] 탭이 켜는 값이다.
     pub show_all: bool,
-    /// 시작 화면에서 어떤 에이전트에게 물을지.
-    pub selected: Vec<bool>,
-    /// 시작 화면의 포커스. 0 은 입력창, 1.. 은 n-1 번째 에이전트다.
-    pub idle_focus: usize,
 
     // ---- 마지막 렌더의 클릭 대상. 마우스 판정에 쓴다. ----
     pane_hit: Vec<(usize, Rect)>,
@@ -95,8 +93,6 @@ pub struct App {
     add_space_hit: Option<Rect>,
     add_session_hit: Option<Rect>,
     all_tab_hit: Option<Rect>,
-    /// 시작 화면의 체크박스 위치.
-    idle_hit: Vec<(usize, Rect)>,
     /// 사이드바의 두 칸 영역. 휠 스크롤을 어디에 적용할지 가른다.
     spaces_area: Rect,
     agents_area: Rect,
@@ -111,7 +107,7 @@ impl App {
             active_space: 0,
             sessions: Vec::new(),
             focus: 0,
-            mode: Mode::Idle,
+            mode: Mode::Panes,
             input: String::new(),
             status: String::new(),
             prefix: false,
@@ -119,8 +115,6 @@ impl App {
             space_scroll: 0,
             agent_scroll: 0,
             show_all: false,
-            selected: vec![true; agents.len()],
-            idle_focus: 0,
             pane_hit: Vec::new(),
             close_hit: Vec::new(),
             space_hit: Vec::new(),
@@ -128,7 +122,6 @@ impl App {
             add_space_hit: None,
             add_session_hit: None,
             all_tab_hit: None,
-            idle_hit: Vec::new(),
             spaces_area: Rect::ZERO,
             agents_area: Rect::ZERO,
         }
@@ -155,29 +148,46 @@ impl App {
         self.visible().len() > MAX_SPLIT
     }
 
-    // ---------- 시작 화면 ----------
+    // ---------- 기동 ----------
 
-    /// 시작 화면 포커스를 옮긴다. 입력창 → 에이전트들 → 다시 입력창.
-    pub fn cycle_idle_focus(&mut self, delta: i32) {
-        let n = self.agents.len() as i32 + 1;
-        self.idle_focus = (((self.idle_focus as i32 + delta) % n + n) % n) as usize;
-    }
-
-    /// 에이전트를 켜고 끈다.
-    pub fn toggle_agent(&mut self, i: usize) {
-        if let Some(v) = self.selected.get_mut(i) {
-            *v = !*v;
-        }
-    }
-
-    /// 시작 화면에서 지금 켜져 있는 에이전트들.
-    pub fn chosen(&self) -> Vec<String> {
-        self.agents
+    /// 기동 직후 **쓸 수 있는 참여자를 전부 띄운다.**
+    ///
+    /// 질문은 넣지 않는다. 각 칸에는 에이전트 자신의 첫 화면(환영 화면·모델
+    /// 표시·입력창)이 그대로 나온다. 곧바로 그 칸에 타이핑해도 되고, Ctrl+A 로
+    /// 전원에게 같은 질문을 넣어도 된다.
+    ///
+    /// 설치돼 있지 않은 참여자는 **조용히 건너뛴다.** 셋 다 있어야 시작할 수
+    /// 있다면 하나만 깔린 환경에서 아무것도 못 하게 된다. 대신 무엇이 빠졌는지
+    /// 상태줄에 한 번 적는다.
+    pub fn bootstrap(&mut self, area: Rect) {
+        let available: Vec<(String, String)> = self
+            .agents
             .iter()
-            .enumerate()
-            .filter(|(i, _)| *self.selected.get(*i).unwrap_or(&true))
-            .map(|(_, (id, _))| id.clone())
-            .collect()
+            .filter(|(id, _)| crate::pty::resolve_agent(id).is_some())
+            .cloned()
+            .collect();
+        let missing: Vec<String> = self
+            .agents
+            .iter()
+            .filter(|(id, _)| crate::pty::resolve_agent(id).is_none())
+            .map(|(_, t)| t.clone())
+            .collect();
+
+        for (id, _) in &available {
+            self.spawn_session(id, area, None);
+        }
+        // 칸 수가 늘면서 앞서 띄운 세션의 크기가 어긋난다. 한 번에 맞춘다.
+        self.sync_sizes(area);
+
+        let vis = self.visible();
+        self.focus = vis.first().copied().unwrap_or(0);
+        self.status = if available.is_empty() {
+            "띄울 수 있는 참여자가 없다. --which 로 설치 상태를 확인한다.".into()
+        } else if missing.is_empty() {
+            HINT.into()
+        } else {
+            format!("{} 는 찾지 못해 건너뛴다 · {HINT}", missing.join(", "))
+        };
     }
 
     // ---------- 공간 ----------
@@ -210,7 +220,9 @@ impl App {
         if !vis.contains(&self.focus) {
             self.focus = vis.first().copied().unwrap_or(0);
         }
-        self.mode = if vis.is_empty() { Mode::Idle } else { Mode::Panes };
+        // 세션이 없는 공간이어도 Panes 다. 빈 칸에 [+] 안내가 나온다.
+        let _ = vis;
+        self.mode = Mode::Panes;
     }
 
     // ---------- 세션 ----------
@@ -244,23 +256,6 @@ impl App {
         }
     }
 
-    /// 시작 화면의 질문으로 **고른 에이전트들을** 띄운다.
-    pub fn start_round(&mut self, question: &str, area: Rect) {
-        let ids = self.chosen();
-        if ids.is_empty() {
-            self.status = "물어볼 에이전트를 하나 이상 골라야 한다".into();
-            return;
-        }
-        for id in ids {
-            self.spawn_session(&id, area, Some(question));
-        }
-        let vis = self.visible();
-        self.focus = vis.first().copied().unwrap_or(0);
-        if self.status.is_empty() {
-            self.status = HINT.into();
-        }
-    }
-
     /// 세션을 닫는다. 자식 프로세스도 정리하고 목록에서 뺀다.
     pub fn close_session(&mut self, i: usize) {
         if i >= self.sessions.len() {
@@ -279,8 +274,8 @@ impl App {
             self.focus = vis.first().copied().unwrap_or(0);
         }
         if vis.is_empty() {
-            self.mode = Mode::Idle;
             self.input.clear();
+            self.status = "이 공간에 세션이 없다. [+] 로 띄운다.".into();
         }
     }
 
@@ -401,11 +396,6 @@ impl App {
                 return Some(Hit::ShowAll);
             }
         }
-        for (i, r) in &self.idle_hit {
-            if contains(r, x, y) {
-                return Some(Hit::ToggleAgent(*i));
-            }
-        }
         // 닫기 버튼이 패널 영역 안에 있으므로 먼저 본다.
         for (i, r) in &self.close_hit {
             if contains(r, x, y) {
@@ -449,7 +439,6 @@ impl App {
 
     pub fn draw(&mut self, f: &mut Frame) {
         match self.mode {
-            Mode::Idle => self.draw_idle(f),
             Mode::Panes => self.draw_panes(f),
             Mode::Picker => {
                 self.draw_panes(f);
@@ -463,96 +452,6 @@ impl App {
                 self.draw_panes(f);
                 self.draw_prompt_box(f, " 모두에게 묻기 (Enter 보내기 · Esc 취소) ");
             }
-        }
-    }
-
-    fn draw_idle(&mut self, f: &mut Frame) {
-        // 시작 화면에서는 패널 쪽 클릭 대상이 모두 무효다.
-        self.pane_hit.clear();
-        self.close_hit.clear();
-        self.space_hit.clear();
-        self.agent_hit.clear();
-        self.add_space_hit = None;
-        self.add_session_hit = None;
-        self.all_tab_hit = None;
-        self.idle_hit.clear();
-
-        let area = f.area();
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(30),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(5),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(0),
-            ])
-            .split(area);
-
-        f.render_widget(
-            Paragraph::new("multi_ai_cli")
-                .style(Style::default().add_modifier(Modifier::BOLD))
-                .centered(),
-            rows[1],
-        );
-        f.render_widget(
-            Paragraph::new(self.active_path().to_string_lossy().into_owned())
-                .style(Style::default().fg(Color::DarkGray))
-                .centered(),
-            rows[2],
-        );
-
-        let w = area.width.min(80);
-        let x0 = area.x + area.width.saturating_sub(w) / 2;
-        let box_area = Rect { x: x0, y: rows[4].y, width: w, height: 5 };
-        let on_input = self.idle_focus == 0;
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(if on_input { Color::Cyan } else { Color::DarkGray }))
-            .title(" 질문을 입력하세요 ");
-        let inner = block.inner(box_area);
-        f.render_widget(block, box_area);
-        f.render_widget(Paragraph::new(self.input.as_str()), inner);
-
-        // 어느 에이전트에게 물을지 고른다.
-        //
-        // Space 는 입력창에서는 띄어쓰기, 체크박스에서는 켜기/끄기다. 같은 키를
-        // 두 뜻으로 쓰므로 **지금 어디에 있는지**를 테두리와 강조로 분명히 한다.
-        let mut spans: Vec<Span> = Vec::new();
-        let mut x = x0;
-        for (i, (_, title)) in self.agents.iter().enumerate() {
-            let on = *self.selected.get(i).unwrap_or(&true);
-            let focused = self.idle_focus == i + 1;
-            let label = format!("[{}] {}", if on { "x" } else { " " }, title);
-            let cw = UnicodeWidthStr::width(label.as_str()) as u16;
-            let mut st = Style::default().fg(if on { Color::Green } else { Color::DarkGray });
-            if focused {
-                st = st.add_modifier(Modifier::REVERSED | Modifier::BOLD);
-            }
-            spans.push(Span::styled(label, st));
-            spans.push(Span::raw("   "));
-            self.idle_hit.push((i, Rect { x, y: rows[6].y, width: cw, height: 1 }));
-            x += cw + 3;
-        }
-        f.render_widget(Paragraph::new(Line::from(spans)), Rect { x: x0, ..rows[6] });
-
-        let hint = if self.status.is_empty() {
-            "Tab 이동 · Space 켜기/끄기 · Enter 시작".to_string()
-        } else {
-            self.status.clone()
-        };
-        f.render_widget(
-            Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
-            Rect { x: x0, ..rows[7] },
-        );
-
-        if on_input {
-            put_cursor(f, inner, &self.input);
         }
     }
 
@@ -668,7 +567,7 @@ impl App {
         let vis = self.visible();
         if vis.is_empty() {
             f.render_widget(
-                Paragraph::new("세션이 없다. [+] 로 에이전트를 띄운다.")
+                Paragraph::new("이 공간에 세션이 없다. 위 [+] 로 에이전트를 띄운다.")
                     .style(Style::default().fg(Color::DarkGray)),
                 area,
             );
@@ -933,7 +832,7 @@ fn common_prefix(items: &[String]) -> String {
     first.chars().take(n).collect()
 }
 
-pub const HINT: &str = "클릭 이동 · [x] 닫기 · [+] 추가 · Ctrl+A 모두에게 묻기 · Alt+←/→ · Ctrl+] 다음 n/q";
+pub const HINT: &str = "칸에 바로 입력 · Ctrl+A 모두에게 묻기 · [+] 추가 · [x] 닫기 · Alt+←/→ 이동 · Ctrl+] 다음 q 종료";
 
 fn contains(r: &Rect, x: u16, y: u16) -> bool {
     r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height

@@ -4,7 +4,7 @@
 //! R2  참여자마다 자기 칸. 포커스된 칸으로만 키가 간다  ← 현재
 //!
 //! 사용법
-//!   multi_ai_cli               시작 화면에서 질문을 입력한다
+//!   multi_ai_cli               쓸 수 있는 참여자를 전부 띄우고 바로 패널로 들어간다
 //!   multi_ai_cli --solo <에이전트>   한 에이전트만 전체 화면으로 (R1 확인용)
 //!   multi_ai_cli --converge [@수렴자] <안건>   구조화 교차검증 → REPORT.md
 //!   multi_ai_cli --rooms       저장된 방 목록
@@ -204,6 +204,11 @@ where
 fn run(term: &mut Term) -> Result<()> {
     let mut app = App::new(AGENTS);
 
+    // 질문을 먼저 묻지 않는다. 크기를 알자마자 참여자를 띄우고 패널로 들어간다.
+    // 크기가 필요해서 App::new 가 아니라 여기서 한다.
+    let a = term.size()?;
+    app.bootstrap(ratatui::layout::Rect::new(0, 0, a.width, a.height));
+
     loop {
         app.tick();
         term.draw(|f| app.draw(f))?;
@@ -218,13 +223,13 @@ fn run(term: &mut Term) -> Result<()> {
         }
         match event::read()? {
             Event::Key(k) => {
+                keylog(&k);
                 // Windows 는 누를 때와 뗄 때를 모두 보낸다. 그대로 넘기면
                 // 한 번 친 키가 두 번 입력된다.
                 if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                     continue;
                 }
                 match app.mode {
-                    Mode::Idle => on_key_idle(&mut app, k, term)?,
                     Mode::Panes => on_key_panes(&mut app, k)?,
                     Mode::Picker => on_key_picker(&mut app, k, term)?,
                     Mode::NewSpace => on_key_new_space(&mut app, k)?,
@@ -241,56 +246,10 @@ fn run(term: &mut Term) -> Result<()> {
     }
 }
 
-/// 시작 화면 — 여기서는 우리가 직접 줄 편집을 한다.
-fn on_key_idle(app: &mut App, k: KeyEvent, term: &mut Term) -> Result<()> {
-    match k.code {
-        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => app.quit = true,
-        KeyCode::Enter => {
-            let q = app.input.trim().to_string();
-            if !q.is_empty() {
-                let a = term.size()?;
-                app.status.clear();
-                app.start_round(&q, ratatui::layout::Rect::new(0, 0, a.width, a.height));
-                // 아무도 안 골랐으면 start_round 가 이유를 남기고 그대로 있는다.
-                if !matches!(app.mode, Mode::Idle) {
-                    app.input.clear();
-                }
-            }
-        }
-        // 입력창과 체크박스 사이를 오간다.
-        KeyCode::Tab => app.cycle_idle_focus(1),
-        KeyCode::BackTab => app.cycle_idle_focus(-1),
-        KeyCode::Right if app.idle_focus > 0 => app.cycle_idle_focus(1),
-        KeyCode::Left if app.idle_focus > 0 => app.cycle_idle_focus(-1),
-        KeyCode::Down => app.cycle_idle_focus(1),
-        KeyCode::Up => app.cycle_idle_focus(-1),
-        // Space 는 체크박스 위에서만 켜기/끄기다. 입력창에서는 띄어쓰기다.
-        KeyCode::Char(' ') if app.idle_focus > 0 => {
-            let i = app.idle_focus - 1;
-            app.toggle_agent(i);
-        }
-        KeyCode::Backspace => {
-            app.idle_focus = 0;
-            app.input.pop();
-        }
-        KeyCode::Esc => {
-            app.idle_focus = 0;
-            app.input.clear();
-        }
-        // 체크박스에 있을 때 글자를 치면 입력창으로 돌아간다. 친 글자는 살린다.
-        KeyCode::Char(c) => {
-            app.idle_focus = 0;
-            app.input.push(c);
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 /// `+` 선택 상자 — 어떤 에이전트를 띄울지 고른다.
 fn on_key_picker(app: &mut App, k: KeyEvent, term: &mut Term) -> Result<()> {
     match k.code {
-        KeyCode::Esc => app.mode = if app.visible().is_empty() { Mode::Idle } else { Mode::Panes },
+        KeyCode::Esc => app.mode = Mode::Panes,
         KeyCode::Char(c @ '1'..='9') => {
             let i = c as usize - '1' as usize;
             if let Some((id, _)) = app.agents.get(i).cloned() {
@@ -309,7 +268,7 @@ fn on_key_new_space(app: &mut App, k: KeyEvent) -> Result<()> {
     match k.code {
         KeyCode::Esc => {
             app.input.clear();
-            app.mode = if app.visible().is_empty() { Mode::Idle } else { Mode::Panes };
+            app.mode = Mode::Panes;
         }
         KeyCode::Enter => {
             let path = app.input.trim().to_string();
@@ -366,9 +325,11 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
         app.prefix = false;
         match k.code {
             KeyCode::Char(c @ '1'..='9') => app.focus_nth(c as usize - '1' as usize),
+            // 새 질문. 예전엔 시작 화면으로 돌아갔지만 그 화면이 없어졌고,
+            // 하려던 일(전원에게 묻기)은 Ctrl+A 와 같다.
             KeyCode::Char('n') => {
-                app.mode = Mode::Idle;
                 app.input.clear();
+                app.mode = Mode::Broadcast;
             }
             KeyCode::Char('q') => app.quit = true,
             // 프리픽스 뒤의 a 는 Ctrl+A 를 **자식에게** 보낸다.
@@ -379,7 +340,7 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
                 }
             }
             // 프리픽스를 한 번 더 누르면 프리픽스 자체를 자식에게 보낸다.
-            KeyCode::Char(']') => {
+            c if is_prefix_key(c) => {
                 if let Some(s) = app.focused() {
                     let _ = s.write(&[0x1d]);
                 }
@@ -411,7 +372,7 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
 
     if k.modifiers.contains(KeyModifiers::CONTROL) {
         match k.code {
-            KeyCode::Char(']') => {
+            c if is_prefix_key(c) => {
                 app.prefix = true;
                 return Ok(());
             }
@@ -477,7 +438,6 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
             app.mode = Mode::NewSpace;
         }
         Some(Hit::AddSession) => app.mode = Mode::Picker,
-        Some(Hit::ToggleAgent(i)) => app.toggle_agent(i),
         None => {}
     }
 }
@@ -521,6 +481,37 @@ fn solo(term: &mut Term, agent: &str) -> Result<()> {
 }
 
 /// crossterm 키 이벤트를 터미널이 보내는 바이트열로 바꾼다.
+/// `MAI_KEYLOG=<파일>` 이 있으면 받은 키를 그대로 적는다.
+///
+/// 키 이름은 crossterm 이 터미널·플랫폼마다 다르게 붙인다. 안 먹는 단축키를
+/// 두고 추측하는 대신 **무엇이 실제로 들어왔는지** 본다. MAI_DUMP 가 PTY
+/// 바이트에 하는 일을 키 쪽에서 하는 것이다.
+fn keylog(k: &KeyEvent) {
+    let Ok(path) = std::env::var("MAI_KEYLOG") else { return };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{:?} mods={:?} kind={:?}", k.code, k.modifiers, k.kind);
+    }
+}
+
+/// Ctrl 과 함께 눌렸을 때 프리픽스로 볼 키인가.
+///
+/// 터미널이 보내는 바이트는 어디서나 0x1D 하나인데 **crossterm 이 붙이는 이름이
+/// 플랫폼마다 다르다.** 유닉스 파서는 0x1C..=0x1F 를 `'4'..'7'` 로 옮기므로
+/// Ctrl+] 가 `Char('5')` 로 들어온다(crossterm 0.29 parse.rs:110). Windows 는
+/// 콘솔 API 에서 가상 키를 직접 받아 `Char(']')` 로 온다.
+///
+/// 한쪽만 보던 탓에 macOS 에서는 프리픽스가 통째로 죽어 있었다 — Ctrl+] 다음의
+/// q(종료)·1..9(포커스)·a 가 전부 자식에게 흘러들어갔다(실측).
+fn is_prefix_key(c: KeyCode) -> bool {
+    match c {
+        KeyCode::Char(']') => true,
+        // 유닉스에서만 받는다. Windows 의 Char('5') 는 진짜 Ctrl+5 다.
+        KeyCode::Char('5') => !cfg!(windows),
+        _ => false,
+    }
+}
+
 fn encode_key(k: &KeyEvent) -> Option<Vec<u8>> {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let b: Vec<u8> = match k.code {
@@ -784,4 +775,45 @@ fn find_cell<'a>(screen: &'a vt100::Screen, ch: char) -> Option<&'a vt100::Cell>
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new(&[("claude", "Claude"), ("codex", "Codex")])
+    }
+    fn key(c: KeyCode, m: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(c, m)
+    }
+
+    /// 프리픽스 키의 **이름**이 플랫폼마다 다르다. 유닉스 crossterm 은 0x1D 를
+    /// `Char('5')` 로, Windows 는 `Char(']')` 로 준다. 한쪽만 보면 그 플랫폼에서
+    /// 프리픽스가 통째로 죽는다 — 실제로 macOS 에서 그랬다.
+    #[test]
+    fn 프리픽스는_두_이름을_모두_받는다() {
+        for name in [KeyCode::Char(']'), KeyCode::Char('5')] {
+            let mut a = app();
+            on_key_panes(&mut a, key(name, KeyModifiers::CONTROL)).unwrap();
+            assert!(a.prefix, "{name:?} 를 프리픽스로 못 받았다");
+        }
+    }
+
+    #[test]
+    fn 프리픽스_다음_q_는_종료다() {
+        let mut a = app();
+        on_key_panes(&mut a, key(KeyCode::Char('5'), KeyModifiers::CONTROL)).unwrap();
+        on_key_panes(&mut a, key(KeyCode::Char('q'), KeyModifiers::empty())).unwrap();
+        assert!(a.quit, "Ctrl+] 다음 q 가 종료로 이어지지 않았다");
+        assert!(!a.prefix, "프리픽스가 한 번 쓰고 풀려야 한다");
+    }
+
+    /// Ctrl+A 는 우리가 «모두에게 묻기»로 가져갔다.
+    #[test]
+    fn ctrl_a_는_모두에게_묻기다() {
+        let mut a = app();
+        on_key_panes(&mut a, key(KeyCode::Char('a'), KeyModifiers::CONTROL)).unwrap();
+        assert!(matches!(a.mode, Mode::Broadcast));
+    }
 }
