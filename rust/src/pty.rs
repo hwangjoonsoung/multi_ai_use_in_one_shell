@@ -252,8 +252,7 @@ pub fn resolve_agent(agent: &str) -> Option<(PathBuf, Vec<String>)> {
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    crate::app::home_var()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
 }

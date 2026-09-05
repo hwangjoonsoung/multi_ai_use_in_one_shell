@@ -889,9 +889,20 @@ pub fn expand_tilde(s: &str) -> PathBuf {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
+    home_var().map(PathBuf::from)
+}
+
+/// 홈 디렉터리 환경 변수. **그 OS 의 것을 먼저 본다.**
+///
+/// 유닉스 셸에도 `USERPROFILE` 이 설정돼 있는 경우가 있다(직접 export, 크로스
+/// 컴파일 도구, wine). 무조건 그쪽을 먼저 보면 엉뚱한 홈을 잡는다. 반대로
+/// Windows 에도 git-bash 등이 `HOME` 을 심어 둔다. 그래서 우선순위를 뒤집는다.
+pub fn home_var() -> Option<std::ffi::OsString> {
+    if cfg!(windows) {
+        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+    } else {
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+    }
 }
 
 /// `prefix` 로 시작하는가 — 대소문자를 가리지 않고, **문자 단위**로 본다.

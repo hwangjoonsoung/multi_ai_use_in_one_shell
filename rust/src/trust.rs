@@ -10,7 +10,9 @@
 //!
 //! 저장 위치 (실측)
 //!   claude  ~/.claude.json      projects[<경로>].hasTrustDialogAccepted = true
-//!   codex   ~/.codex/config.toml  [projects."<소문자 경로>"] trust_level = "trusted"
+//!   codex   ~/.codex/config.toml  [projects."<경로>"] trust_level = "trusted"
+//!           경로 표기는 OS 마다 다르다 — Windows 는 소문자 + 이스케이프된
+//!           역슬래시, macOS/Linux 는 원본 경로 그대로다 (실측).
 //!   agy     신뢰 대화상자를 쓰지 않는다 (확인된 바 없음)
 
 use anyhow::{Context, Result};
@@ -101,10 +103,16 @@ fn trust_codex(ws: &str) -> Result<bool> {
     }
     let text = fs::read_to_string(&path).context("codex 설정을 읽지 못했다")?;
 
-    // codex 는 경로를 소문자 + 이스케이프된 역슬래시로 저장한다.
-    let lower = ws.to_lowercase();
-    let escaped = lower.replace(chr_backslash(), &format!("{0}{0}", chr_backslash()));
-    let header = format!("[projects.\"{escaped}\"]");
+    // Windows 의 codex 는 경로를 소문자 + 이스케이프된 역슬래시로 저장한다.
+    // macOS/Linux 는 파일 시스템이 대소문자를 가리므로 원본 경로를 그대로 쓴다.
+    // 소문자로 낮추면 codex 가 못 알아보는 항목이 하나 더 붙을 뿐이다.
+    let key = if cfg!(windows) {
+        let lower = ws.to_lowercase();
+        lower.replace(chr_backslash(), &format!("{0}{0}", chr_backslash()))
+    } else {
+        ws.to_string()
+    };
+    let header = format!("[projects.\"{key}\"]");
 
     if text.contains(&header) {
         return Ok(false);
@@ -124,9 +132,7 @@ fn trust_codex(ws: &str) -> Result<bool> {
 // ---------- 공통 ----------
 
 fn home() -> Result<std::path::PathBuf> {
-    let h = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .context("홈 디렉터리를 찾지 못했다")?;
+    let h = crate::app::home_var().context("홈 디렉터리를 찾지 못했다")?;
     Ok(std::path::PathBuf::from(h))
 }
 

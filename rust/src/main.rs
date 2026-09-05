@@ -660,14 +660,26 @@ fn selftest() -> Result<()> {
 
     let argv: Vec<String> = std::env::args().skip(2).collect();
     let (prog, args): (String, Vec<String>) = if argv.is_empty() {
-        (
-            "powershell".to_string(),
-            vec![
-                "-NoProfile".into(),
-                "-Command".into(),
-                "$e=[char]27; Write-Host \"${e}[31m빨강${e}[0m OK\"".into(),
-            ],
-        )
+        // 자식은 OS 마다 다르다. 화면에 색이 붙은 한글 한 줄만 나오면 된다.
+        if cfg!(windows) {
+            (
+                "powershell".to_string(),
+                vec![
+                    "-NoProfile".into(),
+                    "-Command".into(),
+                    "$e=[char]27; Write-Host \"${e}[31m빨강${e}[0m OK\"".into(),
+                ],
+            )
+        } else {
+            (
+                "/bin/sh".to_string(),
+                vec![
+                    "-c".into(),
+                    // printf 는 \033 을 풀어 준다. echo -e 는 셸마다 다르게 군다.
+                    "printf '\\033[31m빨강\\033[0m OK\\n'".into(),
+                ],
+            )
+        }
     } else {
         (argv[0].clone(), argv[1..].to_vec())
     };

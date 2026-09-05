@@ -21,8 +21,7 @@ use std::{
 };
 
 pub fn home() -> PathBuf {
-    let base = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
+    let base = crate::app::home_var()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     base.join(".multi-ai-cli")

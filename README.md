@@ -6,15 +6,36 @@ Claude · Codex · Gemini(agy) 세 AI가 한 채팅방에 참여자로 들어와
 
 ## 실행
 
+현행 구현은 **Rust 판**(`rust/`)이다. 아래 Java 판 명령은 참조용으로 남겨 둔다.
+
+### macOS / Linux — Rust 판
+
+```bash
+./scripts/doctor.sh                        # CLI 설치·인증·모델 + Rust 툴체인 점검
+./scripts/rust-build.sh                    # cargo build (--release 도 그대로 넘어간다)
+./scripts/rust-run.sh                      # 현재 디렉터리를 워크스페이스로 실행
+./scripts/rust-run.sh --workspace ~/proj   # 대상 워크스페이스 지정 (D18)
+./scripts/rust-run.sh --which              # 참여자를 어떻게 띄우는지 확인
+./scripts/rust-run.sh --trust              # 현재 디렉터리를 각 에이전트에 신뢰 등록
+./scripts/rust-run.sh --selftest           # PTY+VT 파이프라인 점검
+```
+
+Rust 툴체인이 없으면 먼저 깐다. `rust-build.sh` 는 `~/.cargo/env` 를 알아서 읽는다.
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+세 CLI 중 없는 것은 **비활성 참여자로 빠지고 나머지로 진행한다.** `agy` 가 없어도 앱은 뜬다.
+
+### Windows — Java 판 (참조용)
+
 ```powershell
 .\scripts\doctor.ps1                 # CLI 설치·인증·모델 점검
 .\scripts\compile.ps1                # javac (외부 라이브러리 없음, D12)
-.\scripts
-un.ps1                    # 현재 디렉터리를 워크스페이스로 실행
-.\scripts
-un.ps1 -Workspace C:\proj  # 대상 워크스페이스 지정 (D18)
-.\scripts
-un.ps1 -Room 20260903-141530   # 기존 방 재개
+.\scripts\run.ps1                    # 현재 디렉터리를 워크스페이스로 실행
+.\scripts\run.ps1 -Workspace C:\proj  # 대상 워크스페이스 지정 (D18)
+.\scripts\run.ps1 -Room 20260903-141530   # 기존 방 재개
 ```
 
 방 안에서 쓰는 명령:

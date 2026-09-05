@@ -37,10 +37,28 @@ else
 fi
 
 echo
-echo "== Java =="
+echo "== Rust 툴체인 (현행 구현) =="
+if ! command -v cargo >/dev/null 2>&1 && [[ -f "$HOME/.cargo/env" ]]; then
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+fi
+if command -v cargo >/dev/null 2>&1; then
+    printf '  %-8s %s\n' cargo "$(cargo --version)"
+    printf '  %-8s %s\n' rustc "$(rustc --version 2>&1)"
+else
+    echo "  MISSING — Rust 판을 빌드할 수 없다. 설치:"
+    echo "    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+fi
+
+echo
+echo "== Java (참조용 Java 판) =="
 java_bin="java"
 [[ -n "${JAVA_HOME:-}" && -x "$JAVA_HOME/bin/java" ]] && java_bin="$JAVA_HOME/bin/java"
-"$java_bin" -version 2>&1 | sed 's/^/  /'
+if command -v "$java_bin" >/dev/null 2>&1; then
+    "$java_bin" -version 2>&1 | sed 's/^/  /'
+else
+    echo "  MISSING (Rust 판만 쓸 거면 없어도 된다)"
+fi
 
 echo
 echo "== 저장 위치 =="
