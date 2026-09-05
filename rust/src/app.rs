@@ -89,6 +89,8 @@ pub struct App {
 
     // ---- 마지막 렌더의 클릭 대상. 마우스 판정에 쓴다. ----
     pane_hit: Vec<(usize, Rect)>,
+    /// 칸의 **안쪽** 사각형. 자식 화면이 그려지는 자리라 휠 좌표를 여기서 뺀다.
+    pane_inner: Vec<(usize, Rect)>,
     close_hit: Vec<(usize, Rect)>,
     space_hit: Vec<(usize, Rect)>,
     agent_hit: Vec<(usize, Rect)>,
@@ -128,6 +130,7 @@ impl App {
             agent_scroll: 0,
             show_all: false,
             pane_hit: Vec::new(),
+            pane_inner: Vec::new(),
             close_hit: Vec::new(),
             space_hit: Vec::new(),
             agent_hit: Vec::new(),
@@ -612,8 +615,30 @@ impl App {
         None
     }
 
-    /// 휠 스크롤. 커서가 놓인 칸만 움직인다.
+    /// 휠 스크롤. **커서가 놓인 것만** 움직인다.
+    ///
+    /// 칸 위라면 자식의 몫이다. 에이전트들은 스스로 마우스 추적을 켜고
+    /// (`ESC[?1000h` 등) 자기 화면을 자기가 스크롤한다. 우리가 대신 굴리면
+    /// 자식이 그린 것과 어긋난다. 그래서 **좌표만 칸 기준으로 바꿔 넘긴다.**
+    ///
+    /// 자식이 마우스를 안 받으면(평범한 셸) 그때만 우리 스크롤백을 움직인다.
+    /// 칸 밖이면 사이드바 차례다.
     pub fn scroll(&mut self, x: u16, y: u16, delta: i32) {
+        if let Some(&(i, inner)) = self.pane_inner.iter().find(|(_, r)| contains(r, x, y)) {
+            let (col, row) = (x - inner.x, y - inner.y);
+            let up = delta < 0;
+            let steps = delta.unsigned_abs().max(1);
+            if let Some(p) = self.sessions.get_mut(i).and_then(|s| s.pty.as_mut()) {
+                for _ in 0..steps {
+                    if !p.mouse_wheel(up, col, row) {
+                        p.scroll_view(delta);
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
         let target = if contains(&self.spaces_area, x, y) {
             Some((&mut self.space_scroll, self.spaces.len() + 1))
         } else if contains(&self.agents_area, x, y) {
@@ -658,6 +683,7 @@ impl App {
         // 맞는 것을 돌려주므로 배치가 달랐던 **옛 프레임의 좌표**가 이겼고,
         // 세션을 닫거나 추가한 뒤로는 엉뚱한 에이전트로 옮겨졌다.
         self.pane_hit.clear();
+        self.pane_inner.clear();
         self.close_hit.clear();
         self.add_session_hit = None;
         self.all_tab_hit = None;
@@ -806,6 +832,7 @@ impl App {
                 self.close_hit.push((i, btn));
             }
             self.pane_hit.push((i, a));
+            self.pane_inner.push((i, inner));
 
             if let Some(p) = s.pty.as_ref() {
                 let screen = p.screen();

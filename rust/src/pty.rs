@@ -189,6 +189,38 @@ impl PtySession {
         out
     }
 
+    /// 휠을 자식에게 넘긴다. 자식이 마우스를 안 받으면 false.
+    ///
+    /// 좌표는 **칸 안에서의 위치**여야 한다. 화면 좌표를 그대로 주면 자식은
+    /// 자기 원점을 기준으로 해석해 엉뚱한 곳을 가리킨 것이 된다 — 칸마다
+    /// 원점이 다르기 때문이다.
+    ///
+    /// 인코딩은 자식이 고른 것을 따른다. SGR(`ESC[?1006h`)은 좌표에 상한이
+    /// 없고, 옛 방식은 한 바이트(32+좌표)라 223칸을 넘지 못한다.
+    pub fn mouse_wheel(&mut self, up: bool, col: u16, row: u16) -> bool {
+        use vt100::{MouseProtocolEncoding as Enc, MouseProtocolMode as Mode};
+        let (mode, enc) = match self.parser.lock() {
+            Ok(p) => (p.screen().mouse_protocol_mode(), p.screen().mouse_protocol_encoding()),
+            Err(_) => return false,
+        };
+        if mode == Mode::None {
+            return false;
+        }
+        self.write(&encode_wheel(enc, up, col, row)).is_ok()
+    }
+
+    /// 우리가 들고 있는 스크롤백을 위아래로 옮긴다.
+    ///
+    /// 마우스를 안 받는 자식(평범한 셸)용이다. 대체 화면에서는 스크롤백이
+    /// 0줄이라 아무 일도 일어나지 않는다 — 그쪽은 자식이 직접 그린다.
+    pub fn scroll_view(&mut self, delta: i32) {
+        if let Ok(mut p) = self.parser.lock() {
+            let cur = p.screen().scrollback() as i32;
+            let next = (cur - delta).max(0) as usize;
+            p.screen_mut().set_scrollback(next);
+        }
+    }
+
     /// 자식 프로세스 ID. 서브에이전트(자손 프로세스) 조회의 기준점이다.
     pub fn pid(&self) -> Option<u32> {
         self.child.process_id()
@@ -264,6 +296,33 @@ pub fn resolve_agent(agent: &str) -> Option<(PathBuf, Vec<String>)> {
             resolve("agy").map(|p| (p, vec![]))
         }
         other => resolve(other).map(|p| (p, vec![])),
+    }
+}
+
+/// 휠 한 칸을 자식이 고른 인코딩으로 바꾼다.
+///
+/// 휠은 버튼 64(위)/65(아래)로 보고하고 좌표는 1-기준이다. SGR 은 좌표에 상한이
+/// 없지만 옛 방식은 `32 + 좌표` 를 한 바이트에 담아 223칸에서 막힌다.
+pub fn encode_wheel(
+    enc: vt100::MouseProtocolEncoding,
+    up: bool,
+    col: u16,
+    row: u16,
+) -> Vec<u8> {
+    use vt100::MouseProtocolEncoding as Enc;
+    let btn: u16 = if up { 64 } else { 65 };
+    let (c, r) = (col + 1, row + 1);
+    match enc {
+        Enc::Sgr => format!("\u{1b}[<{btn};{c};{r}M").into_bytes(),
+        // Utf8 도 우리가 보내는 좁은 범위에서는 옛 방식과 같은 바이트다.
+        _ => vec![
+            0x1b,
+            b'[',
+            b'M',
+            (32 + btn).min(255) as u8,
+            (32 + c).min(255) as u8,
+            (32 + r).min(255) as u8,
+        ],
     }
 }
 
@@ -466,5 +525,35 @@ impl PtySession {
             rx_bytes: 0,
             exit_code: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vt100::MouseProtocolEncoding as Enc;
+
+    /// 좌표는 1-기준이다. 0-기준으로 보내면 자식이 한 칸씩 어긋나게 본다.
+    #[test]
+    fn sgr_휠은_1기준_좌표다() {
+        assert_eq!(encode_wheel(Enc::Sgr, true, 0, 0), b"\x1b[<64;1;1M");
+        assert_eq!(encode_wheel(Enc::Sgr, false, 9, 4), b"\x1b[<65;10;5M");
+    }
+
+    /// 옛 방식은 32 를 더해 한 바이트에 담는다.
+    #[test]
+    fn 옛_방식은_32를_더한다() {
+        assert_eq!(
+            encode_wheel(Enc::Default, true, 0, 0),
+            vec![0x1b, b'[', b'M', 32 + 64, 33, 33]
+        );
+    }
+
+    /// 넓은 칸에서 한 바이트를 넘겨도 패닉하지 않는다.
+    #[test]
+    fn 옛_방식은_상한에서_잘린다() {
+        let v = encode_wheel(Enc::Default, false, 400, 400);
+        assert_eq!(v.len(), 6);
+        assert_eq!(v[4], 255);
     }
 }
