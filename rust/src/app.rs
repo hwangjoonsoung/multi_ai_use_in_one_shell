@@ -108,6 +108,8 @@ pub struct App {
     agents_area: Rect,
     /// 마지막으로 그린 전체 영역. 키로 칸을 붙일 때 크기 계산에 쓴다.
     last_area: Rect,
+    /// 자식의 경로를 물어보는 창구. 필요할 때만 만든다.
+    sys: Option<sysinfo::System>,
     /// 인용 전달 상자에 띄울 요약. 무엇을 어디서 몇 자 가져왔는지.
     relay_preview: Option<String>,
     /// 이름을 고치는 중인 칸.
@@ -151,6 +153,7 @@ impl App {
             spaces_area: Rect::ZERO,
             agents_area: Rect::ZERO,
             last_area: Rect::ZERO,
+            sys: None,
             rename_target: None,
             last_tab_click: None,
             relay_preview: None,
@@ -375,8 +378,53 @@ impl App {
         self.sessions.get_mut(self.focus).and_then(|s| s.pty.as_mut())
     }
 
+    /// 포커스된 터미널이 `cd` 했으면 공간을 그쪽으로 옮긴다.
+    ///
+    /// **터미널만 공간을 움직인다.** 에이전트는 자기가 뜬 자리에서 경로를 바꾸지
+    /// 않고, 바꾼다 해도 그건 도구가 잠깐 들어간 것이지 사용자가 옮겨 간 것이
+    /// 아니다. 사용자의 조타는 셸에서 일어난다.
+    ///
+    /// 이미 떠 있는 칸들은 자기 경로 그대로다 — 남의 프로세스 cwd 를 바꿀 수는
+    /// 없다. 바뀌는 것은 «다음에 뜰 칸이 어디서 뜨는가» 와 화면에 적히는 경로다.
+    fn follow_cwd(&mut self) {
+        let Some(s) = self.sessions.get(self.focus) else { return };
+        if !s.is_terminal {
+            return;
+        }
+        // 초당 한 번이면 충분하다. 매 프레임 프로세스를 뒤지는 것은 낭비다.
+        if s.cwd_at.is_some_and(|t| t.elapsed() < Duration::from_millis(900)) {
+            return;
+        }
+        let Some(pid) = s.pty.as_ref().and_then(|p| p.pid()) else { return };
+
+        let sys = self.sys.get_or_insert_with(sysinfo::System::new);
+        let pid = sysinfo::Pid::from_u32(pid);
+        // **cwd 를 명시해서 달라고 해야 한다.** refresh_processes 의 기본 갱신
+        // 종류에는 cwd 가 없어 프로세스는 찾아도 cwd 가 None 으로 온다(실측).
+        // 메모리·CPU·디스크는 우리가 안 쓰므로 빼는 편이 싸기도 하다.
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[pid]),
+            true,
+            sysinfo::ProcessRefreshKind::new().with_cwd(sysinfo::UpdateKind::Always),
+        );
+        let found = sys.process(pid).and_then(|p| p.cwd().map(PathBuf::from));
+
+        let i = self.focus;
+        if let Some(s) = self.sessions.get_mut(i) {
+            s.cwd_at = Some(Instant::now());
+            s.cwd = found.clone();
+        }
+        let Some(cwd) = found else { return };
+        if let Some(sp) = self.spaces.get_mut(self.active_space) {
+            if sp.path != cwd {
+                sp.set_path(cwd);
+            }
+        }
+    }
+
     /// 살아 있는 세션의 출력을 먹이고, 준비된 세션에 프롬프트를 넣는다.
     pub fn tick(&mut self) {
+        self.follow_cwd();
         for s in self.sessions.iter_mut() {
             let before = s.pty.as_ref().map(|p| p.rx_bytes).unwrap_or(0);
             if let Some(p) = s.pty.as_mut() {

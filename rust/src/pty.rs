@@ -557,3 +557,41 @@ mod tests {
         assert_eq!(v[4], 255);
     }
 }
+
+#[cfg(test)]
+mod cwd_tests {
+    use super::*;
+
+    /// 자식 셸의 경로를 실제로 읽어 낼 수 있는가.
+    ///
+    /// 공간이 `cd` 를 따라가려면 이 고리가 성립해야 한다. pid 를 얻고,
+    /// sysinfo 가 그 프로세스를 보고, cwd 를 돌려주는 것 셋 다 필요하다.
+    #[test]
+    fn 자식_셸의_경로를_읽는다() {
+        let mut s = PtySession::spawn_shell_in(24, 80, std::path::Path::new("/usr"))
+            .expect("셸을 띄우지 못했다");
+        let pid = s.pid();
+        eprintln!("pid = {pid:?}");
+        let pid = pid.expect("pid 를 못 얻었다");
+
+        // 셸이 자리를 잡을 때까지 잠깐 기다린다.
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            s.pump();
+        }
+
+        let mut sys = sysinfo::System::new();
+        let p = sysinfo::Pid::from_u32(pid);
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[p]),
+            true,
+            sysinfo::ProcessRefreshKind::new().with_cwd(sysinfo::UpdateKind::Always),
+        );
+        let proc = sys.process(p);
+        eprintln!("프로세스 찾음 = {}", proc.is_some());
+        let cwd = proc.and_then(|x| x.cwd().map(|c| c.to_path_buf()));
+        eprintln!("cwd = {cwd:?}");
+        assert!(cwd.is_some(), "cwd 를 못 읽었다 — 공간이 cd 를 따라갈 수 없다");
+        assert!(cwd.unwrap().ends_with("usr"), "띄운 자리와 다르다");
+    }
+}

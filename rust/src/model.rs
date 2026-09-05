@@ -12,7 +12,7 @@
 
 use crate::pty::PtySession;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -23,11 +23,23 @@ pub struct Space {
 
 impl Space {
     pub fn new(path: PathBuf) -> Self {
-        let name = path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let name = Self::name_of(&path);
         Self { path, name }
+    }
+
+    /// 경로를 바꾼다. 이름도 같이 따라간다.
+    ///
+    /// 터미널 칸에서 `cd` 하면 공간이 그쪽으로 옮겨 간다. 사이드바가 실제와
+    /// 다른 경로를 가리키고 있으면 새 칸이 엉뚱한 데서 뜬다.
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.name = Self::name_of(&path);
+        self.path = path;
+    }
+
+    fn name_of(path: &Path) -> String {
+        path.file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned())
     }
 }
 
@@ -73,6 +85,12 @@ pub struct Session {
     /// 있는데 뒤늦게 끼어드는 것은 방해다. 화살표·Enter 는 세지 않는다 —
     /// 대화상자에 답하는 조작이지 「직접 쓰기」가 아니기 때문이다.
     pub user_typed: bool,
+    /// 자식이 실제로 들어가 있는 경로. 셸이 `cd` 하면 여기가 바뀐다.
+    ///
+    /// 기동할 때의 경로와 다를 수 있어 따로 들고 본다. 매 프레임 조회하면
+    /// 비싸므로 마지막으로 확인한 시각을 함께 둔다.
+    pub cwd: Option<PathBuf>,
+    pub cwd_at: Option<Instant>,
     /// 에이전트가 아니라 사용자의 셸인가.
     ///
     /// 터미널 칸에는 서브에이전트 명부가 있을 리 없고, 화면을 훑어 봐야
@@ -93,6 +111,8 @@ impl Session {
             seen: (0, Instant::now()),
             subs: Vec::new(),
             user_typed: false,
+            cwd: None,
+            cwd_at: None,
             is_terminal: false,
         }
     }
