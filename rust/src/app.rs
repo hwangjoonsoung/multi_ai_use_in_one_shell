@@ -46,6 +46,8 @@ pub enum Mode {
     Broadcast,
     /// 포커스된 칸의 마지막 답변을 나머지 칸으로 넘기는 중
     Relay,
+    /// 탭 이름을 고쳐 쓰는 중
+    RenameTab,
 }
 
 /// 마우스 클릭이 무엇을 가리키는가.
@@ -62,6 +64,8 @@ pub enum Hit {
     AddSession,
     /// 전체 보기 탭
     ShowAll,
+    /// 탭 줄의 칩. 한 번 누르면 포커스, 두 번 누르면 이름 고치기.
+    Tab(usize),
 }
 
 pub struct App {
@@ -91,6 +95,8 @@ pub struct App {
     pane_hit: Vec<(usize, Rect)>,
     /// 칸의 **안쪽** 사각형. 자식 화면이 그려지는 자리라 휠 좌표를 여기서 뺀다.
     pane_inner: Vec<(usize, Rect)>,
+    /// 탭 줄의 칩. 칸 본문과 구분해야 «탭을 두 번 눌렀다»를 알 수 있다.
+    tab_hit: Vec<(usize, Rect)>,
     close_hit: Vec<(usize, Rect)>,
     space_hit: Vec<(usize, Rect)>,
     agent_hit: Vec<(usize, Rect)>,
@@ -104,6 +110,10 @@ pub struct App {
     last_area: Rect,
     /// 인용 전달 상자에 띄울 요약. 무엇을 어디서 몇 자 가져왔는지.
     relay_preview: Option<String>,
+    /// 이름을 고치는 중인 칸.
+    rename_target: Option<usize>,
+    /// 마지막 탭 클릭. 두 번 누름을 가르는 기준이다.
+    last_tab_click: Option<(usize, Instant)>,
     /// 넘길 인용문과 그 출처 이름. 문장은 보낼 때 붙인다.
     relay_quote: Option<(String, crate::relay::Quote)>,
     /// 인용을 받을 후보. (세션 인덱스, 표시명, 켜짐)
@@ -131,6 +141,7 @@ impl App {
             show_all: false,
             pane_hit: Vec::new(),
             pane_inner: Vec::new(),
+            tab_hit: Vec::new(),
             close_hit: Vec::new(),
             space_hit: Vec::new(),
             agent_hit: Vec::new(),
@@ -140,6 +151,8 @@ impl App {
             spaces_area: Rect::ZERO,
             agents_area: Rect::ZERO,
             last_area: Rect::ZERO,
+            rename_target: None,
+            last_tab_click: None,
             relay_preview: None,
             relay_quote: None,
             relay_targets: Vec::new(),
@@ -178,44 +191,39 @@ impl App {
 
     // ---------- 기동 ----------
 
-    /// 기동 직후 **쓸 수 있는 참여자를 전부 띄운다.**
+    /// 기동 직후 **터미널 하나만** 띄운다.
     ///
-    /// 질문은 넣지 않는다. 각 칸에는 에이전트 자신의 첫 화면(환영 화면·모델
-    /// 표시·입력창)이 그대로 나온다. 곧바로 그 칸에 타이핑해도 되고, Ctrl+A 로
-    /// 전원에게 같은 질문을 넣어도 된다.
+    /// 예전엔 쓸 수 있는 에이전트를 전부 자동으로 올렸다. 그런데 늘 셋 다
+    /// 필요한 것은 아니고, 안 쓸 참여자까지 켜 두면 칸이 좁아지고 각자 로그인·
+    /// 업데이트 안내를 띄워 정리부터 해야 했다. 지금은 **빈 작업대에서 시작해
+    /// 필요한 것만 사용자가 붙인다** — `[+]` 가 그 자리다.
     ///
-    /// 설치돼 있지 않은 참여자는 **조용히 건너뛴다.** 셋 다 있어야 시작할 수
-    /// 있다면 하나만 깔린 환경에서 아무것도 못 하게 된다. 대신 무엇이 빠졌는지
-    /// 상태줄에 한 번 적는다.
+    /// 터미널을 기본으로 두는 이유는, 무엇을 붙일지 정하기 전에도 그 경로에서
+    /// 뭔가는 해 보게 되기 때문이다.
     pub fn bootstrap(&mut self, area: Rect) {
-        let available: Vec<(String, String)> = self
-            .agents
-            .iter()
-            .filter(|(id, _)| crate::pty::resolve_agent(id).is_some())
-            .cloned()
-            .collect();
-        let missing: Vec<String> = self
-            .agents
-            .iter()
-            .filter(|(id, _)| crate::pty::resolve_agent(id).is_none())
-            .map(|(_, t)| t.clone())
-            .collect();
-
-        for (id, _) in &available {
-            self.spawn_session(id, area, None);
-        }
-        // 칸 수가 늘면서 앞서 띄운 세션의 크기가 어긋난다. 한 번에 맞춘다.
+        self.spawn_terminal(area);
         self.sync_sizes(area);
+        self.focus = self.visible().first().copied().unwrap_or(0);
+        self.status = HINT.into();
+    }
 
-        let vis = self.visible();
-        self.focus = vis.first().copied().unwrap_or(0);
-        self.status = if available.is_empty() {
-            "띄울 수 있는 참여자가 없다. --which 로 설치 상태를 확인한다.".into()
-        } else if missing.is_empty() {
-            HINT.into()
-        } else {
-            format!("{} 는 찾지 못해 건너뛴다 · {HINT}", missing.join(", "))
-        };
+    /// `[+]` 상자에 늘어놓을 것들. 0번이 터미널, 그다음이 에이전트다.
+    pub fn picker_items(&self) -> Vec<String> {
+        let mut v = vec![format!("터미널 ({})", crate::pty::shell_name())];
+        v.extend(self.agents.iter().map(|(_, t)| t.clone()));
+        v
+    }
+
+    /// `[+]` 상자에서 n 번째를 고른다.
+    pub fn pick(&mut self, n: usize, area: Rect) {
+        if n == 0 {
+            self.spawn_terminal(area);
+            return;
+        }
+        if let Some((id, _)) = self.agents.get(n - 1).cloned() {
+            self.mode = Mode::Panes;
+            self.spawn_session(&id, area, None);
+        }
     }
 
     // ---------- 공간 ----------
@@ -519,6 +527,54 @@ impl App {
         self.relay_targets.iter().filter(|t| t.2).count()
     }
 
+    /// 탭을 두 번 눌렀다. 이름을 고쳐 쓸 준비를 한다.
+    ///
+    /// 이름은 순전히 사람이 보라고 있는 것이다. 「Claude」 셋을 띄워 놓고
+    /// 어느 칸이 무엇을 하는 중인지 구분하려면 제품이 붙인 이름으로는 모자란다.
+    pub fn begin_rename(&mut self, i: usize) {
+        let Some(s) = self.sessions.get(i) else { return };
+        self.input = s.title.clone();
+        self.rename_target = Some(i);
+        self.mode = Mode::RenameTab;
+    }
+
+    /// 고쳐 쓴 이름을 반영한다. 빈 이름은 무시한다 — 지워지면 고를 수가 없다.
+    pub fn commit_rename(&mut self, name: &str) {
+        let Some(i) = self.rename_target.take() else { return };
+        let name = name.trim();
+        if !name.is_empty() {
+            if let Some(s) = self.sessions.get_mut(i) {
+                s.title = name.to_string();
+                self.status = format!("이름을 «{name}» 로 바꿨다");
+            }
+        }
+        self.mode = Mode::Panes;
+    }
+
+    pub fn cancel_rename(&mut self) {
+        self.rename_target = None;
+        self.mode = Mode::Panes;
+    }
+
+    /// 탭을 눌렀다. 짧은 사이에 같은 탭을 두 번이면 이름 고치기다.
+    ///
+    /// crossterm 은 «두 번 누름» 을 따로 알려주지 않는다. 시각과 대상을
+    /// 우리가 들고 있다가 판정한다. 400ms 는 흔한 데스크톱 기준값이다.
+    pub fn tab_click(&mut self, i: usize) {
+        let double = matches!(
+            self.last_tab_click,
+            Some((prev, t)) if prev == i && t.elapsed() < Duration::from_millis(400)
+        );
+        if double {
+            self.last_tab_click = None;
+            self.begin_rename(i);
+            return;
+        }
+        self.last_tab_click = Some((i, Instant::now()));
+        self.focus = i;
+        self.show_all = false;
+    }
+
     /// 인용 전달을 물린다.
     pub fn cancel_relay(&mut self) {
         self.relay_preview = None;
@@ -589,6 +645,11 @@ impl App {
         if let Some(r) = &self.all_tab_hit {
             if contains(r, x, y) {
                 return Some(Hit::ShowAll);
+            }
+        }
+        for (i, r) in &self.tab_hit {
+            if contains(r, x, y) {
+                return Some(Hit::Tab(*i));
             }
         }
         // 닫기 버튼이 패널 영역 안에 있으므로 먼저 본다.
@@ -673,6 +734,10 @@ impl App {
                 self.draw_panes(f);
                 self.draw_relay_box(f);
             }
+            Mode::RenameTab => {
+                self.draw_panes(f);
+                self.draw_prompt_box(f, " 탭 이름 (Enter 확정 · Esc 취소) ");
+            }
         }
     }
 
@@ -684,6 +749,7 @@ impl App {
         // 세션을 닫거나 추가한 뒤로는 엉뚱한 에이전트로 옮겨졌다.
         self.pane_hit.clear();
         self.pane_inner.clear();
+        self.tab_hit.clear();
         self.close_hit.clear();
         self.add_session_hit = None;
         self.all_tab_hit = None;
@@ -771,7 +837,7 @@ impl App {
             // 셋 이하일 때도 칩으로 고를 수 있게 한다. 나란히 다 보이더라도
             // 「지금 키가 어디로 가는지」를 칩으로 바꾸는 편이 빠르다.
             if x + w <= area.right() {
-                self.pane_hit.push((i, Rect { x, y: area.y, width: w, height: 1 }));
+                self.tab_hit.push((i, Rect { x, y: area.y, width: w, height: 1 }));
             }
             x += w + 1;
         }
@@ -851,24 +917,24 @@ impl App {
     /// `+` 를 눌렀을 때의 에이전트 선택 상자.
     fn draw_picker(&self, f: &mut Frame) {
         let area = f.area();
-        let h = self.agents.len() as u16 + 2;
+        let h = self.picker_items().len() as u16 + 2;
         let r = center(area, 40, h);
         f.render_widget(Clear, r);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Green))
-            .title(" 어떤 에이전트를 띄울까 (Esc 취소) ");
+            .title(" 무엇을 띄울까 (숫자 선택 · Esc 취소) ");
         let inner = block.inner(r);
         f.render_widget(block, r);
         let lines: Vec<Line> = self
-            .agents
-            .iter()
+            .picker_items()
+            .into_iter()
             .enumerate()
-            .map(|(i, (_, t))| {
+            .map(|(i, t)| {
                 Line::from(vec![
                     Span::styled(format!(" {} ", i + 1), Style::default().fg(Color::Green)),
-                    Span::raw(t.clone()),
+                    Span::raw(t),
                 ])
             })
             .collect();
@@ -1124,7 +1190,7 @@ fn common_prefix(items: &[String]) -> String {
     first.chars().take(n).collect()
 }
 
-pub const HINT: &str = "칸에 바로 입력 · Ctrl+A 모두에게 묻기 · [+] 터미널 · [x] 닫기 · Alt+←/→ 이동 · Ctrl+] 다음 p 에이전트 · q 종료";
+pub const HINT: &str = "[+] 칸 추가 · 탭 두 번 눌러 이름 바꾸기 · [x] 닫기 · Ctrl+A 모두에게 묻기 · Ctrl+] 다음 f 답 넘기기 · q 종료";
 
 fn contains(r: &Rect, x: u16, y: u16) -> bool {
     r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height

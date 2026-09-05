@@ -266,6 +266,7 @@ fn run(term: &mut Term) -> Result<()> {
                     Mode::NewSpace => on_key_new_space(&mut app, k)?,
                     Mode::Broadcast => on_key_broadcast(&mut app, k)?,
                     Mode::Relay => on_key_relay(&mut app, k)?,
+                    Mode::RenameTab => on_key_rename(&mut app, k)?,
                 }
             }
             Event::Mouse(m) => on_mouse(&mut app, m),
@@ -284,11 +285,9 @@ fn on_key_picker(app: &mut App, k: KeyEvent, term: &mut Term) -> Result<()> {
         KeyCode::Esc => app.mode = Mode::Panes,
         KeyCode::Char(c @ '1'..='9') => {
             let i = c as usize - '1' as usize;
-            if let Some((id, _)) = app.agents.get(i).cloned() {
-                let a = term.size()?;
-                app.mode = Mode::Panes;
-                app.spawn_session(&id, ratatui::layout::Rect::new(0, 0, a.width, a.height), None);
-            }
+            let a = term.size()?;
+            app.mode = Mode::Panes;
+            app.pick(i, ratatui::layout::Rect::new(0, 0, a.width, a.height));
         }
         _ => {}
     }
@@ -338,6 +337,27 @@ fn on_key_broadcast(app: &mut App, k: KeyEvent) -> Result<()> {
             }
             app.input.clear();
             app.mode = Mode::Panes;
+        }
+        KeyCode::Backspace => {
+            app.input.pop();
+        }
+        KeyCode::Char(c) => app.input.push(c),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// 탭 이름 고치기 — 한 줄 편집.
+fn on_key_rename(app: &mut App, k: KeyEvent) -> Result<()> {
+    match k.code {
+        KeyCode::Esc => {
+            app.input.clear();
+            app.cancel_rename();
+        }
+        KeyCode::Enter => {
+            let name = app.input.trim().to_string();
+            app.commit_rename(&name);
+            app.input.clear();
         }
         KeyCode::Backspace => {
             app.input.pop();
@@ -510,6 +530,8 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
     match app.hit_test(m.column, m.row) {
         Some(Hit::Close(i)) => app.close_session(i),
         Some(Hit::ShowAll) => app.show_all = true,
+        // 탭 칩 — 한 번이면 포커스, 짧은 사이에 두 번이면 이름 고치기.
+        Some(Hit::Tab(i)) => app.tab_click(i),
         Some(Hit::Focus(i)) => {
             // 특정 에이전트를 고르면 전체 보기에서 빠져나온다.
             app.show_all = false;
@@ -520,12 +542,10 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
             app.input = app.active_path().to_string_lossy().into_owned();
             app.mode = Mode::NewSpace;
         }
-        // [+] 는 터미널을 붙인다. 에이전트는 기동 때 이미 다 떠 있고,
-        // 이 자리에서 아쉬운 건 같은 경로에서 명령을 쳐 볼 셸이다.
-        Some(Hit::AddSession) => {
-            let a = app.last_area();
-            app.spawn_terminal(a);
-        }
+        // [+] 는 무엇을 띄울지 묻는다. 기동 때 아무것도 자동으로 뜨지 않으므로
+        // 에이전트를 붙이는 길이 여기에 있어야 한다. 터미널만 빠르게 붙이려면
+        // Ctrl+] t 가 상자를 건너뛴다.
+        Some(Hit::AddSession) => app.mode = Mode::Picker,
         None => {}
     }
 }
@@ -924,6 +944,73 @@ mod tests {
         let (exe, _) = pty::resolve_shell().expect("셸이 하나는 있어야 한다");
         assert!(exe.is_file(), "{exe:?} 가 실행 파일이 아니다");
         assert!(!pty::shell_name().is_empty());
+    }
+
+    fn app_with_tabs() -> App {
+        let mut a = app();
+        a.sessions.push(model::Session::terminal("zsh", 0));
+        a.sessions.push(model::Session::terminal("zsh 2", 0));
+        a
+    }
+
+    /// crossterm 은 «두 번 누름» 을 알려주지 않는다. 우리가 시각으로 가른다.
+    #[test]
+    fn 탭을_빠르게_두_번_누르면_이름_고치기다() {
+        let mut a = app_with_tabs();
+        a.tab_click(1);
+        assert!(matches!(a.mode, Mode::Panes), "한 번은 포커스만");
+        assert_eq!(a.focus, 1);
+        a.tab_click(1);
+        assert!(matches!(a.mode, Mode::RenameTab), "두 번이면 이름 고치기");
+        assert_eq!(a.input, "zsh 2", "지금 이름이 채워져 있어야 고쳐 쓴다");
+    }
+
+    /// 다른 탭을 잇달아 누른 것은 두 번 누름이 아니다.
+    #[test]
+    fn 서로_다른_탭은_두_번_누름이_아니다() {
+        let mut a = app_with_tabs();
+        a.tab_click(0);
+        a.tab_click(1);
+        assert!(matches!(a.mode, Mode::Panes));
+        assert_eq!(a.focus, 1);
+    }
+
+    /// 사이가 뜨면 두 번 누름이 아니다.
+    #[test]
+    fn 천천히_두_번_누르면_포커스만_옮긴다() {
+        let mut a = app_with_tabs();
+        a.tab_click(1);
+        std::thread::sleep(Duration::from_millis(450));
+        a.tab_click(1);
+        assert!(matches!(a.mode, Mode::Panes));
+    }
+
+    #[test]
+    fn 이름을_고쳐_쓴다() {
+        let mut a = app_with_tabs();
+        a.begin_rename(0);
+        a.commit_rename("계획 담당");
+        assert_eq!(a.sessions[0].title, "계획 담당");
+        assert!(matches!(a.mode, Mode::Panes));
+    }
+
+    /// 빈 이름을 받으면 지운다. 이름이 없으면 탭을 고를 수가 없다.
+    #[test]
+    fn 빈_이름은_무시한다() {
+        let mut a = app_with_tabs();
+        a.begin_rename(0);
+        a.commit_rename("   ");
+        assert_eq!(a.sessions[0].title, "zsh");
+    }
+
+    /// `[+]` 상자의 0번은 터미널이고 그다음이 에이전트다.
+    #[test]
+    fn 선택_상자는_터미널을_앞세운다() {
+        let a = app();
+        let items = a.picker_items();
+        assert!(items[0].starts_with("터미널"), "{items:?}");
+        assert_eq!(items.len(), a.agents.len() + 1);
+        assert_eq!(items[1], "Claude");
     }
 
     /// Ctrl+A 는 우리가 «모두에게 묻기»로 가져갔다.

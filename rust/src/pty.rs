@@ -198,7 +198,7 @@ impl PtySession {
     /// 인코딩은 자식이 고른 것을 따른다. SGR(`ESC[?1006h`)은 좌표에 상한이
     /// 없고, 옛 방식은 한 바이트(32+좌표)라 223칸을 넘지 못한다.
     pub fn mouse_wheel(&mut self, up: bool, col: u16, row: u16) -> bool {
-        use vt100::{MouseProtocolEncoding as Enc, MouseProtocolMode as Mode};
+        use vt100::MouseProtocolMode as Mode;
         let (mode, enc) = match self.parser.lock() {
             Ok(p) => (p.screen().mouse_protocol_mode(), p.screen().mouse_protocol_encoding()),
             Err(_) => return false,
