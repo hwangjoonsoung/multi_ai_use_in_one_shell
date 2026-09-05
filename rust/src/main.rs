@@ -31,7 +31,10 @@ use app::{App, Hit, Mode};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
-    event::{DisableMouseCapture, EnableMouseCapture, MouseButton, MouseEvent, MouseEventKind},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, MouseButton,
+        MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
@@ -220,10 +223,27 @@ where
     enable_raw_mode()?;
     let mut out = io::stdout();
     execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+
+    // 바깥 터미널에 **키를 구분해서 달라**고 청한다.
+    //
+    // 이게 없으면 Shift+Enter 가 그냥 CR 로 와서 Enter 와 구분되지 않는다.
+    // 지원하는 터미널에서만 켠다 — 안 되는 터미널에 밀어 넣으면 켜졌다고
+    // 착각한 채 응답을 기다린다. macOS 기본 터미널은 지원하지 않으므로
+    // 그쪽에서는 Option+Enter 가 대신이다(ESC CR 로 오고 우리가 알아본다).
+    let enhanced = matches!(crossterm::terminal::supports_keyboard_enhancement(), Ok(true));
+    if enhanced {
+        execute!(
+            out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
     let mut term = Terminal::new(CrosstermBackend::new(out))?;
 
     let result = body(&mut term);
 
+    if enhanced {
+        let _ = execute!(term.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     disable_raw_mode()?;
     execute!(term.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     term.show_cursor()?;
@@ -632,7 +652,16 @@ fn encode_key(k: &KeyEvent) -> Option<Vec<u8>> {
             }
         }
         KeyCode::Char(c) => c.to_string().into_bytes(),
-        KeyCode::Enter => vec![b'\r'],
+        // Shift+Enter / Alt+Enter 는 **줄바꿈**이다. 전송이 아니다.
+    //
+    // 터미널은 예로부터 Enter 와 Shift+Enter 를 구분하지 않고 둘 다 CR 만
+    // 보냈다. 그래서 에이전트들은 «ESC CR» 을 줄바꿈 신호로 받기로 하고 있다
+    // (실측: Claude 입력창에서 ESC CR, CSI 13;2u, 역슬래시+CR 셋 다 줄바꿈).
+    // 우리가 그 변환을 맡는다.
+    KeyCode::Enter if k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+        b"\x1b\r".to_vec()
+    }
+    KeyCode::Enter => vec![b'\r'],
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Backspace => vec![0x7f],
@@ -1011,6 +1040,21 @@ mod tests {
         assert!(items[0].starts_with("터미널"), "{items:?}");
         assert_eq!(items.len(), a.agents.len() + 1);
         assert_eq!(items[1], "Claude");
+    }
+
+    /// Enter 는 전송, Shift/Alt+Enter 는 줄바꿈(ESC CR)이다.
+    ///
+    /// 터미널은 예로부터 둘을 구분하지 않고 CR 만 보냈다. 구분해 주는
+    /// 터미널에서는 우리가 «ESC CR» 로 바꿔 에이전트에게 넘긴다.
+    #[test]
+    fn shift_enter_는_줄바꿈이다() {
+        let plain = encode_key(&key(KeyCode::Enter, KeyModifiers::empty())).unwrap();
+        assert_eq!(plain, b"\r", "맨 Enter 는 그대로 전송이다");
+
+        for m in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+            let v = encode_key(&key(KeyCode::Enter, m)).unwrap();
+            assert_eq!(v, b"\x1b\r", "{m:?} + Enter 는 줄바꿈이어야 한다");
+        }
     }
 
     /// Ctrl+A 는 우리가 «모두에게 묻기»로 가져갔다.
