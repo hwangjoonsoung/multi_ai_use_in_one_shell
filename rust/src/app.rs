@@ -96,6 +96,8 @@ pub struct App {
     /// 사이드바의 두 칸 영역. 휠 스크롤을 어디에 적용할지 가른다.
     spaces_area: Rect,
     agents_area: Rect,
+    /// 마지막으로 그린 전체 영역. 키로 칸을 붙일 때 크기 계산에 쓴다.
+    last_area: Rect,
 }
 
 impl App {
@@ -124,7 +126,16 @@ impl App {
             all_tab_hit: None,
             spaces_area: Rect::ZERO,
             agents_area: Rect::ZERO,
+            last_area: Rect::ZERO,
         }
+    }
+
+    /// 마지막으로 그린 전체 영역.
+    ///
+    /// 새 칸의 크기는 전체 영역에서 계산한다. 키 처리에는 터미널 핸들이 없어
+    /// 매 프레임 sync_sizes 가 넘겨 주는 값을 기억해 둔다.
+    pub fn last_area(&self) -> Rect {
+        self.last_area
     }
 
     pub fn active_path(&self) -> PathBuf {
@@ -256,6 +267,44 @@ impl App {
         }
     }
 
+    /// 지금 공간에 **터미널** 칸을 하나 붙인다.
+    ///
+    /// `[+]` 가 하는 일이다. 예전엔 여기서 에이전트를 골랐지만, 에이전트는 이미
+    /// 기동 때 다 떠 있다. 그 자리에서 실제로 아쉬운 건 «같은 경로에서 명령을
+    /// 쳐 볼 셸» 이라 그걸 기본으로 삼는다. 에이전트를 되살리려면 Ctrl+] p.
+    pub fn spawn_terminal(&mut self, area: Rect) {
+        let n = (self.visible().len() + 1).min(MAX_SPLIT);
+        let (h, w) = pane_size(area, n);
+        let cwd = self.active_path();
+
+        // 같은 공간에서 몇 번째 터미널인지 세어 이름을 붙인다.
+        let used = self
+            .visible()
+            .iter()
+            .filter(|&&i| self.sessions[i].is_terminal)
+            .count();
+        let title = if used == 0 {
+            crate::pty::shell_name()
+        } else {
+            format!("{} {}", crate::pty::shell_name(), used + 1)
+        };
+
+        let mut sess = Session::terminal(&title, self.active_space);
+        match PtySession::spawn_shell_in(h, w, &cwd) {
+            Ok(pty) => {
+                sess.pty = Some(pty);
+                sess.size = (h, w);
+                sess.started = Some(Instant::now());
+                sess.seen = (0, Instant::now());
+                self.sessions.push(sess);
+                self.focus = self.sessions.len() - 1;
+                self.mode = Mode::Panes;
+                self.status = format!("터미널 «{title}» 을 {} 에서 띄웠다", cwd.display());
+            }
+            Err(e) => self.status = format!("터미널 기동 실패 — {e}"),
+        }
+    }
+
     /// 세션을 닫는다. 자식 프로세스도 정리하고 목록에서 뺀다.
     pub fn close_session(&mut self, i: usize) {
         if i >= self.sessions.len() {
@@ -337,6 +386,7 @@ impl App {
 
     /// 화면 크기가 바뀌면 각 PTY 도 자기 칸 크기로 맞춘다.
     pub fn sync_sizes(&mut self, area: Rect) {
+        self.last_area = area;
         let n = if self.tabbed() && !self.show_all { 1 } else { self.visible().len() };
         let (h, w) = pane_size(area, n);
         for i in self.visible() {
@@ -496,7 +546,8 @@ impl App {
         self.draw_bodies(f, right[1]);
 
         let hint = if self.prefix {
-            "Ctrl+] 눌림 — n 새 질문 · a Ctrl+A 를 자식에게 · q 종료 · 1..9 포커스".to_string()
+            "Ctrl+] 눌림 — t 터미널 · p 에이전트 · n 모두에게 묻기 · a Ctrl+A 를 자식에게 · q 종료 · 1..9 포커스"
+                .to_string()
         } else {
             self.status.clone()
         };
@@ -567,7 +618,7 @@ impl App {
         let vis = self.visible();
         if vis.is_empty() {
             f.render_widget(
-                Paragraph::new("이 공간에 세션이 없다. 위 [+] 로 에이전트를 띄운다.")
+                Paragraph::new("이 공간에 세션이 없다. [+] 터미널 · Ctrl+] 다음 p 에이전트.")
                     .style(Style::default().fg(Color::DarkGray)),
                 area,
             );
@@ -634,7 +685,7 @@ impl App {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Green))
-            .title(" 어떤 에이전트를 띄울까 ");
+            .title(" 어떤 에이전트를 띄울까 (Esc 취소) ");
         let inner = block.inner(r);
         f.render_widget(block, r);
         let lines: Vec<Line> = self
@@ -832,7 +883,7 @@ fn common_prefix(items: &[String]) -> String {
     first.chars().take(n).collect()
 }
 
-pub const HINT: &str = "칸에 바로 입력 · Ctrl+A 모두에게 묻기 · [+] 추가 · [x] 닫기 · Alt+←/→ 이동 · Ctrl+] 다음 q 종료";
+pub const HINT: &str = "칸에 바로 입력 · Ctrl+A 모두에게 묻기 · [+] 터미널 · [x] 닫기 · Alt+←/→ 이동 · Ctrl+] 다음 p 에이전트 · q 종료";
 
 fn contains(r: &Rect, x: u16, y: u16) -> bool {
     r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height

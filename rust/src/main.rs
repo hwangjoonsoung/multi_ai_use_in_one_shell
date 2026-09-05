@@ -332,6 +332,13 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
                 app.mode = Mode::Broadcast;
             }
             KeyCode::Char('q') => app.quit = true,
+            // t 터미널 추가 — [+] 클릭과 같다.
+            KeyCode::Char('t') => {
+                let a = app.last_area();
+                app.spawn_terminal(a);
+            }
+            // p 에이전트 선택 상자. 닫은 참여자를 되살릴 때 쓴다.
+            KeyCode::Char('p') => app.mode = Mode::Picker,
             // 프리픽스 뒤의 a 는 Ctrl+A 를 **자식에게** 보낸다.
             // Ctrl+A 자체는 우리가 «모두에게 묻기»로 가져갔기 때문이다.
             KeyCode::Char('a') => {
@@ -437,7 +444,12 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
             app.input = app.active_path().to_string_lossy().into_owned();
             app.mode = Mode::NewSpace;
         }
-        Some(Hit::AddSession) => app.mode = Mode::Picker,
+        // [+] 는 터미널을 붙인다. 에이전트는 기동 때 이미 다 떠 있고,
+        // 이 자리에서 아쉬운 건 같은 경로에서 명령을 쳐 볼 셸이다.
+        Some(Hit::AddSession) => {
+            let a = app.last_area();
+            app.spawn_terminal(a);
+        }
         None => {}
     }
 }
@@ -807,6 +819,35 @@ mod tests {
         on_key_panes(&mut a, key(KeyCode::Char('q'), KeyModifiers::empty())).unwrap();
         assert!(a.quit, "Ctrl+] 다음 q 가 종료로 이어지지 않았다");
         assert!(!a.prefix, "프리픽스가 한 번 쓰고 풀려야 한다");
+    }
+
+    /// `[+]` 와 Ctrl+] t 는 터미널을 붙인다. 에이전트 선택 상자가 아니다.
+    #[test]
+    fn 프리픽스_t_는_터미널을_붙인다() {
+        let mut a = app();
+        let before = a.sessions.len();
+        on_key_panes(&mut a, key(KeyCode::Char('5'), KeyModifiers::CONTROL)).unwrap();
+        on_key_panes(&mut a, key(KeyCode::Char('t'), KeyModifiers::empty())).unwrap();
+        assert_eq!(a.sessions.len(), before + 1, "터미널 칸이 안 생겼다");
+        let s = a.sessions.last().expect("방금 붙인 칸");
+        assert!(s.is_terminal, "터미널로 표시돼야 한다");
+        assert!(matches!(a.mode, Mode::Panes), "선택 상자로 새면 안 된다");
+    }
+
+    /// 닫은 참여자를 되살리는 길은 남아 있어야 한다.
+    #[test]
+    fn 프리픽스_p_는_에이전트_선택_상자다() {
+        let mut a = app();
+        on_key_panes(&mut a, key(KeyCode::Char('5'), KeyModifiers::CONTROL)).unwrap();
+        on_key_panes(&mut a, key(KeyCode::Char('p'), KeyModifiers::empty())).unwrap();
+        assert!(matches!(a.mode, Mode::Picker));
+    }
+
+    #[test]
+    fn 셸을_해석한다() {
+        let (exe, _) = pty::resolve_shell().expect("셸이 하나는 있어야 한다");
+        assert!(exe.is_file(), "{exe:?} 가 실행 파일이 아니다");
+        assert!(!pty::shell_name().is_empty());
     }
 
     /// Ctrl+A 는 우리가 «모두에게 묻기»로 가져갔다.

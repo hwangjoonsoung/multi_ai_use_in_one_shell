@@ -73,6 +73,11 @@ pub struct Session {
     /// 있는데 뒤늦게 끼어드는 것은 방해다. 화살표·Enter 는 세지 않는다 —
     /// 대화상자에 답하는 조작이지 「직접 쓰기」가 아니기 때문이다.
     pub user_typed: bool,
+    /// 에이전트가 아니라 사용자의 셸인가.
+    ///
+    /// 터미널 칸에는 서브에이전트 명부가 있을 리 없고, 화면을 훑어 봐야
+    /// 셸 출력에서 헛것을 읽을 뿐이다. 그래서 스캔을 건너뛴다.
+    pub is_terminal: bool,
 }
 
 impl Session {
@@ -88,14 +93,22 @@ impl Session {
             seen: (0, Instant::now()),
             subs: Vec::new(),
             user_typed: false,
+            is_terminal: false,
         }
+    }
+
+    /// 터미널 세션. 에이전트가 아니라 사용자의 셸이 도는 칸이다.
+    pub fn terminal(title: &str, space: usize) -> Self {
+        let mut s = Self::new("", title, space);
+        s.is_terminal = true;
+        s
     }
 
     /// 화면에서 서브에이전트 명부를 다시 읽는다.
     ///
     /// 매 프레임 전체 화면을 훑는 것은 낭비라 **새 출력이 있을 때만** 한다.
     pub fn refresh_subs(&mut self, changed: bool) {
-        if !changed {
+        if !changed || self.is_terminal {
             return;
         }
         self.subs = match self.pty.as_ref() {

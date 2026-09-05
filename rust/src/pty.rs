@@ -41,6 +41,22 @@ impl PtySession {
     pub fn spawn_in(agent: &str, rows: u16, cols: u16, cwd: &std::path::Path) -> Result<Self> {
         let (exe, prefix) = resolve_agent(agent)
             .ok_or_else(|| anyhow!("실행 파일을 찾지 못했다: {agent}"))?;
+        Self::spawn_exe(exe, prefix, rows, cols, cwd)
+    }
+
+    /// 사용자의 셸을 그 공간의 경로에서 띄운다.
+    pub fn spawn_shell_in(rows: u16, cols: u16, cwd: &std::path::Path) -> Result<Self> {
+        let (exe, prefix) = resolve_shell().ok_or_else(|| anyhow!("셸을 찾지 못했다"))?;
+        Self::spawn_exe(exe, prefix, rows, cols, cwd)
+    }
+
+    fn spawn_exe(
+        exe: PathBuf,
+        prefix: Vec<String>,
+        rows: u16,
+        cols: u16,
+        cwd: &std::path::Path,
+    ) -> Result<Self> {
 
         let pty = portable_pty::native_pty_system();
         let pair = pty
@@ -249,6 +265,43 @@ pub fn resolve_agent(agent: &str) -> Option<(PathBuf, Vec<String>)> {
         }
         other => resolve(other).map(|p| (p, vec![])),
     }
+}
+
+/// 사용자의 대화형 셸을 어떻게 띄울지 해석한다.
+///
+/// 에이전트와 달리 셸은 **환경이 정해 준다.** `$SHELL` 을 먼저 보고, 없으면
+/// 그 OS 의 관례적인 셸로 떨어진다. 인자는 주지 않는다 — PTY 에 붙은 셸은
+/// 그것만으로 대화형이고, rc 파일도 알아서 읽는다.
+pub fn resolve_shell() -> Option<(PathBuf, Vec<String>)> {
+    if cfg!(windows) {
+        // COMSPEC 은 cmd.exe 를 가리킨다. PowerShell 이 있으면 그쪽이 낫다.
+        for name in ["pwsh", "powershell"] {
+            if let Some(p) = resolve(name) {
+                return Some((p, vec!["-NoLogo".into()]));
+            }
+        }
+        return std::env::var_os("COMSPEC").map(|c| (PathBuf::from(c), vec![]));
+    }
+    if let Some(sh) = std::env::var_os("SHELL") {
+        let p = PathBuf::from(sh);
+        if p.is_file() {
+            return Some((p, vec![]));
+        }
+    }
+    for cand in ["/bin/zsh", "/bin/bash", "/bin/sh"] {
+        let p = PathBuf::from(cand);
+        if p.is_file() {
+            return Some((p, vec![]));
+        }
+    }
+    None
+}
+
+/// 셸 실행 파일의 표시용 이름. `/bin/zsh` -> `zsh`.
+pub fn shell_name() -> String {
+    resolve_shell()
+        .and_then(|(p, _)| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "셸".into())
 }
 
 fn home_dir() -> PathBuf {
