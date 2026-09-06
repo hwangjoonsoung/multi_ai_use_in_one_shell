@@ -16,6 +16,8 @@
 //!   multi_ai_cli --probe       셸과 «cd 따라가기» 가 이 환경에서 되는지 점검
 
 mod app;
+mod selection;
+mod terminal_input;
 mod modal;
 mod model;
 mod subagents;
@@ -33,7 +35,7 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     event::{
-        DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, MouseButton,
+        DisableMouseCapture, EnableMouseCapture, DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags, MouseButton,
         MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -224,7 +226,7 @@ where
 {
     enable_raw_mode()?;
     let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
 
     // 바깥 터미널에 **키를 구분해서 달라**고 청한다.
     //
@@ -247,7 +249,7 @@ where
         let _ = execute!(term.backend_mut(), PopKeyboardEnhancementFlags);
     }
     disable_raw_mode()?;
-    execute!(term.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
+    execute!(term.backend_mut(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen)?;
     term.show_cursor()?;
     result
 }
@@ -291,8 +293,10 @@ fn run(term: &mut Term) -> Result<()> {
                     Mode::RenameTab => on_key_rename(&mut app, k)?,
                 }
             }
+            Event::Paste(text) => on_paste(&mut app, &text)?,
             Event::Mouse(m) => on_mouse(&mut app, m),
             Event::Resize(_, _) => {
+                app.selection = None;
                 let a = term.size()?;
                 app.sync_sizes(ratatui::layout::Rect::new(0, 0, a.width, a.height));
             }
@@ -439,14 +443,17 @@ fn on_key_relay(app: &mut App, k: KeyEvent) -> Result<()> {
 fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
     if app.prefix {
         app.prefix = false;
+        app.selection = None;
         match k.code {
             KeyCode::Char(c @ '1'..='9') => app.focus_nth(c as usize - '1' as usize),
             // 새 질문. 예전엔 시작 화면으로 돌아갔지만 그 화면이 없어졌고,
-            // 하려던 일(전원에게 묻기)은 Ctrl+A 와 같다.
+            // 전원에게 묻기는 프리픽스 뒤 n 으로 실행한다.
             KeyCode::Char('n') => {
                 app.input.clear();
                 app.mode = Mode::Broadcast;
             }
+            KeyCode::Left => app.cycle_focus(-1),
+            KeyCode::Right => app.cycle_focus(1),
             KeyCode::Char('q') => app.quit = true,
             // t 터미널 추가 — [+] 클릭과 같다.
             KeyCode::Char('t') => {
@@ -457,8 +464,7 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
             KeyCode::Char('p') => app.mode = Mode::Picker,
             // f 이 칸의 마지막 답변을 나머지 칸으로 넘긴다.
             KeyCode::Char('f') => app.prepare_relay(),
-            // 프리픽스 뒤의 a 는 Ctrl+A 를 **자식에게** 보낸다.
-            // Ctrl+A 자체는 우리가 «모두에게 묻기»로 가져갔기 때문이다.
+            // 기존 프리픽스 a 조작도 호환한다. Ctrl+A 직접 입력도 전달된다.
             KeyCode::Char('a') => {
                 if let Some(s) = app.focused() {
                     let _ = s.write(&[0x01]);
@@ -475,52 +481,31 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
-    // Alt+화살표 / Alt+숫자로 바로 이동한다. 프리픽스보다 빠르고,
-    // 에이전트 TUI 들이 Alt+방향키를 거의 쓰지 않아 충돌이 적다.
-    if k.modifiers.contains(KeyModifiers::ALT) {
-        match k.code {
-            KeyCode::Left => {
-                app.cycle_focus(-1);
-                return Ok(());
-            }
-            KeyCode::Right => {
-                app.cycle_focus(1);
-                return Ok(());
-            }
-            KeyCode::Char(c @ '1'..='9') => {
-                app.focus_nth(c as usize - '1' as usize);
-                return Ok(());
-            }
-            _ => {}
-        }
-    }
-
     if k.modifiers.contains(KeyModifiers::CONTROL) {
         match k.code {
             c if is_prefix_key(c) => {
                 app.prefix = true;
                 return Ok(());
             }
-            // 모두에게 한 번에 묻는다.
-            //
-            // 자식들도 Ctrl+A 를 쓸 수 있다(줄 맨 앞으로). 그 기능이 필요하면
-            // 프리픽스를 거쳐 Ctrl+] 다음 a 로 보낼 수 있게 열어 뒀다.
-            KeyCode::Char('a') => {
-                app.input.clear();
-                app.mode = Mode::Broadcast;
-                return Ok(());
-            }
             _ => {}
         }
     }
 
-    if let Some(bytes) = encode_key(&k) {
+    if matches!(k.code, KeyCode::Char('c' | 'C')) && k.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) && app.selection.is_some() {
+        copy_selection(app);
+        return Ok(());
+    }
+    if k.code == KeyCode::Esc && app.selection.take().is_some() { return Ok(()); }
+    app.selection = None;
+    let application_cursor = app.focused().is_some_and(|p| p.screen().application_cursor());
+    if let Some(bytes) = terminal_input::key(&k, application_cursor) {
         // 글자를 친 것만 «직접 쓰기»로 센다. 화살표·Enter 는 대화상자에 답하는
         // 조작이라 대기 중인 질문을 취소시키면 안 된다.
         let typed = matches!(k.code, KeyCode::Char(_)) && !k.modifiers.contains(KeyModifiers::CONTROL);
         let focus = app.focus;
         if let Some(s) = app.focused() {
-            let _ = s.write(&bytes);
+            s.scroll_view(i32::MAX);
+            if let Err(e) = s.write(&bytes) { app.status = format!("입력 전달 실패: {e}"); }
         }
         if typed {
             if let Some(s) = app.sessions.get_mut(focus) {
@@ -533,9 +518,63 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
 
 /// 클릭으로 패널을 고르거나 닫는다.
 ///
-/// 마우스는 우리가 먹는다. 자식에게 넘기면 에이전트가 자기 좌표계로 해석해
-/// 엉뚱한 곳을 누른 것이 된다 — 패널마다 원점이 다르기 때문이다.
+/// 자식의 마우스 추적 모드에 따라 패널 좌표로 전달하거나 로컬 텍스트를 선택한다.
 fn on_mouse(app: &mut App, m: MouseEvent) {
+    if !matches!(app.mode, Mode::Panes) { return; }
+    if let Some((i, area)) = app.mouse_capture {
+        if matches!(m.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_)) {
+            let local = MouseEvent {
+                column: m.column.saturating_sub(area.x).min(area.width.saturating_sub(1)),
+                row: m.row.saturating_sub(area.y).min(area.height.saturating_sub(1)), ..m
+            };
+            if let Some(p) = app.sessions.get_mut(i).and_then(|s| s.pty.as_mut()) {
+                if let Some(bytes) = terminal_input::mouse(&p.screen(), local) {
+                    if let Err(e) = p.write(&bytes) { app.status = format!("마우스 전달 실패: {e}"); }
+                }
+            }
+            if matches!(m.kind, MouseEventKind::Up(_)) { app.mouse_capture = None; }
+            return;
+        }
+        if matches!(m.kind, MouseEventKind::Down(_)) { app.mouse_capture = None; }
+    }
+    if app.selection.as_ref().is_some_and(|s| s.dragging) && matches!(m.kind, MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)) {
+        let sel = app.selection.as_mut().unwrap();
+        if let Some((_, area)) = app.pane_inner.iter().find(|(i, _)| *i == sel.pane) {
+            sel.end = (m.row.saturating_sub(area.y).min(area.height.saturating_sub(1)), m.column.saturating_sub(area.x).min(area.width.saturating_sub(1)));
+        }
+        if matches!(m.kind, MouseEventKind::Up(_)) {
+            sel.dragging = false;
+            if sel.anchor != sel.end { copy_selection(app); } else { app.selection = None; }
+        }
+        return;
+    }
+    if let Some(&(i, area)) = app.pane_inner.iter().find(|(_, r)| r.contains((m.column, m.row).into())) {
+        if let Some(p) = app.sessions.get_mut(i).and_then(|s| s.pty.as_mut()) {
+            let screen = p.screen();
+            let local = MouseEvent { column: m.column - area.x, row: m.row - area.y, ..m };
+            if !m.modifiers.contains(KeyModifiers::SHIFT) && screen.scrollback() == 0 {
+                if let Some(bytes) = terminal_input::mouse(&screen, local) {
+                    if !matches!(m.kind, MouseEventKind::Moved) { app.selection = None; }
+                    if matches!(m.kind, MouseEventKind::Down(_)) { app.focus = i; app.selection = None; app.mouse_capture = Some((i, area)); }
+                    if let Err(e) = p.write(&bytes) { app.status = format!("마우스 전달 실패: {e}"); }
+                    return;
+                }
+            }
+            if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                app.focus = i;
+                let point = (local.row, local.column);
+                app.selection = Some(selection::Selection { pane: i, screen, anchor: point, end: point, dragging: true });
+                return;
+            }
+            if matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+                app.selection = None;
+                p.scroll_view(if m.kind == MouseEventKind::ScrollUp { -3 } else { 3 });
+                return;
+            }
+        }
+    }
+    if matches!(m.kind, MouseEventKind::Down(_)) { app.selection = None; }
+
     // 휠은 사이드바 스크롤에 쓴다. 커서가 놓인 칸만 움직인다.
     match m.kind {
         MouseEventKind::ScrollUp => {
@@ -599,10 +638,11 @@ fn solo(term: &mut Term, agent: &str) -> Result<()> {
                     if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char(']') {
                         return Ok(());
                     }
-                    if let Some(b) = encode_key(&k) {
+                    if let Some(b) = terminal_input::key(&k, session.screen().application_cursor()) {
                         session.write(&b)?;
                     }
                 }
+                Event::Paste(text) => session.write(&terminal_input::paste(&text, session.screen().bracketed_paste()))?,
                 Event::Resize(c, r) => session.resize(r, c)?,
                 _ => {}
             }
@@ -642,45 +682,38 @@ fn is_prefix_key(c: KeyCode) -> bool {
     }
 }
 
+#[cfg(test)]
 fn encode_key(k: &KeyEvent) -> Option<Vec<u8>> {
-    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-    let b: Vec<u8> = match k.code {
-        KeyCode::Char(c) if ctrl => {
-            let up = c.to_ascii_uppercase();
-            if up.is_ascii_uppercase() {
-                vec![up as u8 - b'A' + 1]
-            } else {
-                return None;
-            }
+    terminal_input::key(k, false)
+}
+
+fn on_paste(app: &mut App, text: &str) -> Result<()> {
+    if matches!(app.mode, Mode::Panes) {
+        app.selection = None;
+        app.prefix = false;
+        let focus = app.focus;
+        if let Some(p) = app.focused() {
+            let bytes = terminal_input::paste(text, p.screen().bracketed_paste());
+            p.scroll_view(i32::MAX);
+            if let Err(e) = p.write(&bytes) { app.status = format!("붙여넣기 실패: {e}"); }
         }
-        KeyCode::Char(c) => c.to_string().into_bytes(),
-        // Shift+Enter / Alt+Enter 는 **줄바꿈**이다. 전송이 아니다.
-    //
-    // 터미널은 예로부터 Enter 와 Shift+Enter 를 구분하지 않고 둘 다 CR 만
-    // 보냈다. 그래서 에이전트들은 «ESC CR» 을 줄바꿈 신호로 받기로 하고 있다
-    // (실측: Claude 입력창에서 ESC CR, CSI 13;2u, 역슬래시+CR 셋 다 줄바꿈).
-    // 우리가 그 변환을 맡는다.
-    KeyCode::Enter if k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
-        b"\x1b\r".to_vec()
+        if let Some(s) = app.sessions.get_mut(focus) { s.user_typed = true; }
+    } else if !matches!(app.mode, Mode::Picker) {
+        app.input.push_str(text);
     }
-    KeyCode::Enter => vec![b'\r'],
-        KeyCode::Tab => vec![b'\t'],
-        KeyCode::BackTab => b"\x1b[Z".to_vec(),
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::Insert => b"\x1b[2~".to_vec(),
-        _ => return None,
-    };
-    Some(b)
+    Ok(())
+}
+
+fn copy_selection(app: &mut App) {
+    if let Some(sel) = &app.selection {
+        let text = sel.text();
+        if !text.is_empty() {
+            app.status = match selection::copy(&text) {
+                Ok(()) => "선택 영역 복사됨 · Esc/입력으로 선택 해제".into(),
+                Err(e) => format!("복사 실패: {e}"),
+            };
+        }
+    }
 }
 
 // ---------- 구조화 수렴 (헤드리스) ----------
@@ -1141,11 +1174,37 @@ mod tests {
         }
     }
 
-    /// Ctrl+A 는 우리가 «모두에게 묻기»로 가져갔다.
     #[test]
-    fn ctrl_a_는_모두에게_묻기다() {
+    fn prefix_n_broadcast_and_alt_keys_stay_in_panes() {
+        let mut a = app();
+        on_key_panes(&mut a, key(KeyCode::Char('1'), KeyModifiers::ALT)).unwrap();
+        assert!(matches!(a.mode, Mode::Panes));
+        on_key_panes(&mut a, key(KeyCode::Char(']'), KeyModifiers::CONTROL)).unwrap();
+        on_key_panes(&mut a, key(KeyCode::Char('n'), KeyModifiers::NONE)).unwrap();
+        assert!(matches!(a.mode, Mode::Broadcast));
+        on_paste(&mut a, "한글\n둘째 줄").unwrap();
+        assert_eq!(a.input, "한글\n둘째 줄");
+    }
+
+    #[test]
+    fn dragging_clamps_to_original_pane_and_modal_ignores_mouse() {
+        let mut a = app();
+        let p = vt100::Parser::new(4, 10, 0);
+        a.pane_inner.push((0, ratatui::layout::Rect::new(20, 3, 10, 4)));
+        a.selection = Some(selection::Selection { pane: 0, screen: p.screen().clone(), anchor: (0, 0), end: (0, 0), dragging: true });
+        let m = MouseEvent { kind: MouseEventKind::Drag(MouseButton::Left), column: 99, row: 99, modifiers: KeyModifiers::NONE };
+        on_mouse(&mut a, m);
+        assert_eq!(a.selection.as_ref().unwrap().end, (3, 9));
+        a.mode = Mode::NewSpace;
+        on_mouse(&mut a, MouseEvent { column: 20, row: 3, ..m });
+        assert_eq!(a.selection.as_ref().unwrap().end, (3, 9));
+    }
+
+    /// Ctrl+A 는 셸의 줄 처음 이동 등에 쓰이므로 가로채지 않는다.
+    #[test]
+    fn ctrl_a_는_자식에게_전달한다() {
         let mut a = app();
         on_key_panes(&mut a, key(KeyCode::Char('a'), KeyModifiers::CONTROL)).unwrap();
-        assert!(matches!(a.mode, Mode::Broadcast));
+        assert!(matches!(a.mode, Mode::Panes));
     }
 }

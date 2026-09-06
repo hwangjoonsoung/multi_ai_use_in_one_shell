@@ -9,7 +9,7 @@
 //! **시작하자마자 Panes 다.** 예전엔 질문을 먼저 받는 Idle 화면을 거쳤는데,
 //! 그 화면은 에이전트를 띄우기 위한 관문일 뿐이라 한 번 쓰고 다시 볼 일이
 //! 없었다. 지금은 기동과 동시에 쓸 수 있는 참여자를 전부 띄우고, 각 칸에는
-//! 에이전트 자신의 첫 화면이 그대로 보인다. 질문은 Ctrl+A 로 언제든 넣는다.
+//! 에이전트 자신의 첫 화면이 그대로 보인다. 질문은 Ctrl+] 다음 n 으로 언제든 넣는다.
 //!
 //! 키는 기본적으로 **포커스된 세션의 자식에게 그대로** 간다. 그래야 권한 승인·
 //! 슬래시 자동완성·esc 중단이 동작한다. 우리 조작은 tmux 처럼 프리픽스로 뺀다.
@@ -94,7 +94,9 @@ pub struct App {
     // ---- 마지막 렌더의 클릭 대상. 마우스 판정에 쓴다. ----
     pane_hit: Vec<(usize, Rect)>,
     /// 칸의 **안쪽** 사각형. 자식 화면이 그려지는 자리라 휠 좌표를 여기서 뺀다.
-    pane_inner: Vec<(usize, Rect)>,
+    pub(crate) pane_inner: Vec<(usize, Rect)>,
+    pub selection: Option<crate::selection::Selection>,
+    pub mouse_capture: Option<(usize, Rect)>,
     /// 탭 줄의 칩. 칸 본문과 구분해야 «탭을 두 번 눌렀다»를 알 수 있다.
     tab_hit: Vec<(usize, Rect)>,
     close_hit: Vec<(usize, Rect)>,
@@ -143,6 +145,8 @@ impl App {
             show_all: false,
             pane_hit: Vec::new(),
             pane_inner: Vec::new(),
+            selection: None,
+            mouse_capture: None,
             tab_hit: Vec::new(),
             close_hit: Vec::new(),
             space_hit: Vec::new(),
@@ -942,9 +946,11 @@ impl App {
             self.pane_inner.push((i, inner));
 
             if let Some(p) = s.pty.as_ref() {
-                let screen = p.screen();
+                let selection = self.selection.as_ref().filter(|sel| sel.pane == i);
+                let screen = selection.map(|sel| sel.screen.clone()).unwrap_or_else(|| p.screen());
                 f.render_widget(VtScreen::new(&screen), inner);
-                if focused && !screen.hide_cursor() {
+                if let Some(sel) = selection { sel.highlight(inner, f.buffer_mut()); }
+                if focused && selection.is_none() && screen.scrollback() == 0 && !screen.hide_cursor() {
                     let (r, c) = screen.cursor_position();
                     f.set_cursor_position((
                         (inner.x + c).min(inner.right().saturating_sub(1)),
@@ -1231,7 +1237,7 @@ fn common_prefix(items: &[String]) -> String {
     first.chars().take(n).collect()
 }
 
-pub const HINT: &str = "[+] 칸 추가 · 탭 두 번 눌러 이름 바꾸기 · [x] 닫기 · Ctrl+A 모두에게 묻기 · Ctrl+] 다음 f 답 넘기기 · q 종료";
+pub const HINT: &str = "[+] 칸 추가 · 탭 두 번 눌러 이름 바꾸기 · [x] 닫기 · 드래그 복사 · Ctrl+] 다음 n 모두에게 묻기 · Ctrl+] 다음 f 답 넘기기 · q 종료";
 
 fn contains(r: &Rect, x: u16, y: u16) -> bool {
     r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height

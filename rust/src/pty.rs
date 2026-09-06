@@ -64,6 +64,9 @@ impl PtySession {
             .context("PTY 를 열지 못했다")?;
 
         let mut cmd = CommandBuilder::new(exe);
+        // Advertise the emulator we implement, not the outer terminal’s private protocols.
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
         for a in &prefix {
             cmd.arg(a);
         }
@@ -603,5 +606,47 @@ mod cwd_tests {
         eprintln!("cwd = {cwd:?}");
         assert!(cwd.is_some(), "cwd 를 못 읽었다 — 공간이 cd 를 따라갈 수 없다");
         assert!(cwd.unwrap().ends_with("usr"), "띄운 자리와 다르다");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod terminal_regressions {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn real_pty_unicode_input_and_resize() {
+        let mut session = PtySession::spawn_raw("/bin/sh", &["-c", "stty -echo; printf READY; IFS= read -r line; printf '<%s>\\n' \"$line\"; stty size"], 24, 80).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session.screen().contents().contains("READY") {
+            session.pump();
+            assert!(Instant::now() < deadline, "shell did not become ready");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        session.resize(31, 97).unwrap();
+        assert_eq!(session.screen().size(), (31, 97));
+        session.write("한글 café\r".as_bytes()).unwrap();
+        loop {
+            session.pump();
+            let output = session.screen().contents();
+            if output.contains("<한글 café>") && output.contains("31 97") { break; }
+            assert!(Instant::now() < deadline, "PTY output: {output:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn scrollback_and_alternate_screen_restore() {
+        let mut p = vt100::Parser::new(3, 12, 2000);
+        p.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        p.screen_mut().set_scrollback(2);
+        assert_eq!(p.screen().scrollback(), 2);
+        assert!(p.screen().contents().contains("one"));
+        p.screen_mut().set_scrollback(0);
+        p.process(b"\x1b[?1049hALT");
+        p.screen_mut().set_scrollback(20);
+        assert_eq!(p.screen().scrollback(), 0);
+        p.process(b"\x1b[?1049l");
+        assert!(p.screen().contents().contains("five"));
     }
 }
