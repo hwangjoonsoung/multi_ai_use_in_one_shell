@@ -25,6 +25,8 @@ pub struct PtySession {
     pub rx_bytes: usize,
     /// 진단용 — 자식 종료 코드
     pub exit_code: Option<u32>,
+    // Lifetime follows the shell; no global PATH or shell rc changes.
+    _codex_shim: Option<CodexShim>,
 }
 
 impl PtySession {
@@ -41,13 +43,13 @@ impl PtySession {
     pub fn spawn_in(agent: &str, rows: u16, cols: u16, cwd: &std::path::Path) -> Result<Self> {
         let (exe, prefix) = resolve_agent(agent)
             .ok_or_else(|| anyhow!("실행 파일을 찾지 못했다: {agent}"))?;
-        Self::spawn_exe(exe, prefix, rows, cols, cwd)
+        Self::spawn_exe(exe, prefix, rows, cols, cwd, false)
     }
 
     /// 사용자의 셸을 그 공간의 경로에서 띄운다.
     pub fn spawn_shell_in(rows: u16, cols: u16, cwd: &std::path::Path) -> Result<Self> {
         let (exe, prefix) = resolve_shell().ok_or_else(|| anyhow!("셸을 찾지 못했다"))?;
-        Self::spawn_exe(exe, prefix, rows, cols, cwd)
+        Self::spawn_exe(exe, prefix, rows, cols, cwd, true)
     }
 
     fn spawn_exe(
@@ -56,6 +58,7 @@ impl PtySession {
         rows: u16,
         cols: u16,
         cwd: &std::path::Path,
+        shell: bool,
     ) -> Result<Self> {
 
         let pty = portable_pty::native_pty_system();
@@ -63,7 +66,9 @@ impl PtySession {
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .context("PTY 를 열지 못했다")?;
 
+        let codex_shim = if shell { CodexShim::for_shell()? } else { None };
         let mut cmd = CommandBuilder::new(exe);
+        if let Some(shim) = &codex_shim { cmd.env("PATH", shim.path()?); }
         // Advertise the emulator we implement, not the outer terminal’s private protocols.
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
@@ -108,6 +113,7 @@ impl PtySession {
             done: false,
             rx_bytes: 0,
             exit_code: None,
+            _codex_shim: codex_shim,
         })
     }
 
@@ -275,6 +281,55 @@ impl Drop for PtySession {
     }
 }
 
+/// Session-local Codex entry point for commands typed in a shell panel.
+/// The user's shell configuration and the parent process environment are untouched.
+struct CodexShim(std::path::PathBuf);
+
+impl CodexShim {
+    #[cfg(unix)]
+    fn for_shell() -> Result<Option<Self>> {
+        match resolve_codex() {
+            Some((exe, args)) => Self::new(&exe, &args).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn for_shell() -> Result<Option<Self>> { Ok(None) }
+
+    #[cfg(unix)]
+    fn new(exe: &std::path::Path, args: &[String]) -> Result<Self> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let dir = std::env::temp_dir().join(format!("mai-codex-{}-{time}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        let shim = Self(dir);
+        let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
+        let command = std::iter::once(exe.to_string_lossy().into_owned()).chain(args.iter().cloned())
+            .map(|arg| quote(&arg)).collect::<Vec<_>>().join(" ");
+        let script = format!("#!/bin/sh\nfor arg do\n  if [ \"$arg\" = --no-alt-screen ]; then exec {command} \"$@\"; fi\ndone\nexec {command} --no-alt-screen \"$@\"\n");
+        let file = shim.0.join("codex");
+        std::fs::write(&file, script)?;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700))?;
+        Ok(shim)
+    }
+
+    fn path(&self) -> Result<std::ffi::OsString> {
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        Ok(std::env::join_paths(std::iter::once(self.0.clone()).chain(std::env::split_paths(&inherited)))?)
+    }
+}
+
+impl Drop for CodexShim {
+    fn drop(&mut self) {
+        // Remove only the two artifacts we created; never recursively delete a path.
+        let _ = std::fs::remove_file(self.0.join("codex"));
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
 /// 에이전트를 어떻게 띄울지 해석한다.
 ///
 /// 반환값은 (실행 파일, 선행 인자) 다. codex 처럼 실행 파일이 PATH 에
@@ -289,7 +344,10 @@ pub fn resolve_agent(agent: &str) -> Option<(PathBuf, Vec<String>)> {
         return Some((direct, vec![]));
     }
     match agent {
-        "codex" => resolve_codex(),
+        "codex" => resolve_codex().map(|(exe, mut args)| {
+            args.push("--no-alt-screen".into());
+            (exe, args)
+        }),
         // agy 는 macOS 에서 ~/.local/bin 에 설치되는 경우가 많다 (SPEC §8.4 K6).
         "agy" if !cfg!(windows) => {
             let local = home_dir().join(".local/bin/agy");
@@ -404,6 +462,9 @@ fn resolve_codex() -> Option<(PathBuf, Vec<String>)> {
                 return Some((exe, vec![]));
             }
         }
+    }
+    if !cfg!(windows) {
+        if let Some(exe) = resolve("codex") { return Some((exe, vec![])); }
     }
     let node = resolve("node")?;
     for root in npm_roots() {
@@ -545,6 +606,7 @@ impl PtySession {
             done: false,
             rx_bytes: 0,
             exit_code: None,
+            _codex_shim: None,
         })
     }
 }
@@ -633,6 +695,63 @@ mod terminal_regressions {
             assert!(Instant::now() < deadline, "PTY output: {output:?}");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn codex_shim_preserves_arguments_and_cleans_up() {
+        let args = vec!["-c".into(), "printf '%s\\n' \"$@\"".into(), "arg0".into()];
+        let shim = CodexShim::new(std::path::Path::new("/bin/sh"), &args).unwrap();
+        let path = shim.0.clone();
+        for input in [vec!["a b", "한글", "a'b"], vec!["--no-alt-screen", "resume", "--last"]] {
+            let result = std::process::Command::new(path.join("codex")).args(&input).output().unwrap();
+            assert!(result.status.success());
+            let output = String::from_utf8(result.stdout).unwrap();
+            let expected = if input[0] == "--no-alt-screen" { input.clone() } else { std::iter::once("--no-alt-screen").chain(input.iter().copied()).collect() };
+            assert_eq!(output.lines().collect::<Vec<_>>(), expected);
+        }
+        drop(shim);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn output_arriving_while_scrolled_keeps_view_and_capacity() {
+        let mut p = vt100::Parser::new(4, 12, 3);
+        p.process(b"one\r\ntwo\r\nthree\r\nCOMPOSER\x1b[1;3r\x1b[3;1H\r\nfour");
+        p.screen_mut().set_scrollback(1);
+        let before = p.screen().contents();
+        p.process(b"\r\nfive");
+        assert_eq!(p.screen().scrollback(), 2);
+        assert_eq!(p.screen().contents(), before);
+        p.process(b"\r\nsix\r\nseven");
+        p.screen_mut().set_scrollback(99);
+        assert_eq!(p.screen().scrollback(), 3);
+    }
+
+    // Codex keeps a composer below its history and scrolls only rows 1..3.
+    #[test]
+    fn top_anchored_partial_scroll_retains_output_and_footer() {
+        let mut p = vt100::Parser::new(5, 16, 2000);
+        p.process(b"oldest\r\nsecond\r\nthird\r\nCOMPOSER\r\nSTATUS");
+        p.process(b"\x1b[1;3r\x1b[3;1H\r\nnewest");
+        assert!(p.screen().contents().contains("COMPOSER"));
+        assert!(p.screen().contents().contains("STATUS"));
+        p.screen_mut().set_scrollback(1);
+        assert_eq!(p.screen().scrollback(), 1, "top row lost by partial scroll");
+        assert!(p.screen().contents().starts_with("oldest"));
+        p.screen_mut().set_scrollback(0);
+        assert!(p.screen().contents().starts_with("second"));
+    }
+
+    #[test]
+    fn interior_region_and_alternate_screen_do_not_pollute_history() {
+        let mut p = vt100::Parser::new(5, 16, 2000);
+        p.process(b"HEADER\r\none\r\ntwo\r\nthree\r\nFOOTER");
+        p.process(b"\x1b[2;4r\x1b[4;1H\r\nnew");
+        p.screen_mut().set_scrollback(99);
+        assert_eq!(p.screen().scrollback(), 0);
+        p.process(b"\x1b[?1049h\x1b[1;3r\x1b[3;1H\r\nalt");
+        p.screen_mut().set_scrollback(99);
+        assert_eq!(p.screen().scrollback(), 0);
     }
 
     #[test]

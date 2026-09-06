@@ -1200,6 +1200,86 @@ mod tests {
         assert_eq!(a.selection.as_ref().unwrap().end, (3, 9));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn wheel_browses_partial_region_output_and_selection_still_works() {
+        let mut a = app();
+        let mut session = model::Session::terminal("fixture", 0);
+        session.pty = Some(pty::PtySession::spawn_raw("/bin/sh", &["-c", "printf 'oldest\\r\\nsecond\\r\\nthird\\r\\nCOMPOSER\\r\\nSTATUS\\033[1;3r\\033[3;1H\\r\\nnewest'"], 5, 16).unwrap());
+        a.sessions.push(session);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !a.focused().unwrap().screen().contents().contains("newest") {
+            a.focused().unwrap().pump();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        a.pane_inner.push((0, ratatui::layout::Rect::new(20, 3, 16, 5)));
+        let mouse = |kind, col, row| MouseEvent { kind, column: col, row, modifiers: KeyModifiers::NONE };
+        on_mouse(&mut a, mouse(MouseEventKind::ScrollUp, 22, 4));
+        assert!(a.focused().unwrap().screen().contents().starts_with("oldest"));
+        on_mouse(&mut a, mouse(MouseEventKind::Down(MouseButton::Left), 20, 3));
+        on_mouse(&mut a, mouse(MouseEventKind::Drag(MouseButton::Left), 25, 3));
+        assert_eq!(a.selection.as_ref().unwrap().text(), "oldest");
+        // No release here: do not change the user's clipboard during automated tests.
+        a.selection = None;
+        on_mouse(&mut a, mouse(MouseEventKind::ScrollDown, 22, 4));
+        assert_eq!(a.focused().unwrap().screen().scrollback(), 0);
+        assert!(a.focused().unwrap().screen().contents().contains("COMPOSER"));
+    }
+
+    /// Explicit opt-in integration probe: starts only owned PTYs, sends built-in
+    /// /status commands (no model request), then exits them. Requires installed Codex.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires installed/authenticated Codex and shell runtime"]
+    fn live_codex_wheel_both_launch_paths() {
+        fn pump_for(a: &mut App, ms: u64) {
+            let deadline = std::time::Instant::now() + Duration::from_millis(ms);
+            while std::time::Instant::now() < deadline {
+                a.focused().unwrap().pump();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        for shell in [false, true] {
+            let mut a = app();
+            let cwd = std::env::current_dir().unwrap();
+            let mut session = model::Session::terminal("Codex probe", 0);
+            session.pty = Some(if shell { pty::PtySession::spawn_shell_in(24, 100, &cwd).unwrap() }
+                else { pty::PtySession::spawn_in("codex", 24, 100, &cwd).unwrap() });
+            a.sessions.push(session);
+            a.pane_inner.push((0, ratatui::layout::Rect::new(20, 3, 100, 24)));
+            if shell {
+                pump_for(&mut a, 1500);
+                a.focused().unwrap().write(b"command -v codex\r").unwrap();
+                pump_for(&mut a, 500);
+                assert!(a.focused().unwrap().screen().contents().contains("mai-codex-"), "shell bypassed session wrapper");
+                a.focused().unwrap().write(b"exec codex\r").unwrap();
+            }
+            pump_for(&mut a, 5000);
+            assert!(!a.focused().unwrap().finished(), "Codex did not start");
+            for _ in 0..4 {
+                on_paste(&mut a, "/status").unwrap();
+                on_key_panes(&mut a, key(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+                pump_for(&mut a, 650);
+            }
+            let live = a.focused().unwrap().screen();
+            assert!(!live.alternate_screen());
+            let m = MouseEvent {kind: MouseEventKind::ScrollUp, column: 30, row: 10, modifiers: KeyModifiers::NONE};
+            for _ in 0..100 { on_mouse(&mut a, m); }
+            let old = a.focused().unwrap().screen();
+            assert!(old.scrollback() > 0, "no past output: shell={shell}");
+            assert_ne!(old.contents(), live.contents());
+            println!("path={} history_rows={} mouse={:?} alternate={}", if shell { "shell codex" } else { "+ Codex" }, old.scrollback(), live.mouse_protocol_mode(), live.alternate_screen());
+            for _ in 0..100 { on_mouse(&mut a, MouseEvent { kind: MouseEventKind::ScrollDown, ..m }); }
+            assert_eq!(a.focused().unwrap().screen().scrollback(), 0);
+            assert_eq!(a.focused().unwrap().screen().contents(), live.contents());
+            on_paste(&mut a, "/quit").unwrap();
+            on_key_panes(&mut a, key(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+            pump_for(&mut a, 1000);
+            // PtySession::Drop terminates an owned process if it did not exit itself.
+        }
+    }
+
     /// Ctrl+A 는 셸의 줄 처음 이동 등에 쓰이므로 가로채지 않는다.
     #[test]
     fn ctrl_a_는_자식에게_전달한다() {
